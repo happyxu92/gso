@@ -38,13 +38,19 @@ def continued_command(lines: list[list[str | Path]]) -> str:
     return separator.join(" ".join(quote(part) for part in line) for line in lines)
 
 
+def logged_command(rendered_command: str, log_path: Path) -> str:
+    return f"{rendered_command} 2>&1 | tee {quote(log_path)}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Resolve GSO paths and render commands without executing them."
     )
     parser.add_argument("yaml_path", type=Path, help="Experiment YAML")
     parser.add_argument("--repo-root", type=Path, required=True, help="GSO repo root")
-    parser.add_argument("--api", help="Render generation/execution/evaluation for one API")
+    parser.add_argument(
+        "--api", help="Render generation/execution/evaluation for one API"
+    )
     parser.add_argument("--base-image", default=DEFAULT_BASE_IMAGE)
     parser.add_argument("--docker-platform", default="linux/amd64")
     parser.add_argument("--rebuild-docker-image", action="store_true")
@@ -77,14 +83,18 @@ def main() -> None:
     exp_dir = bucket / "experiments" / exp_id
     problems_path = exp_dir / f"{exp_id}_problems.json"
     results_path = exp_dir / f"{exp_id}_results_docker.json"
-    logs_path = exp_dir / "docker_logs"
+    docker_logs_path = exp_dir / "docker_logs"
     dataset_name = f"gso_{exp_id}"
     dataset_path = bucket / "datasets" / f"{dataset_name}_dataset.jsonl"
     repo_image = f"gso-{exp_id}:latest"
-    pids_path = repo_root / f"{exp_id}_custom_pids.py"
+    workspace_dir = repo_root / "experiments" / repo_name
+    run_logs_path = workspace_dir / "logs"
+    plots_path = workspace_dir / "plots"
+    pids_path = workspace_dir / "custom_pids.py"
 
     paths = {
         "repo_root": str(repo_root),
+        "workspace_dir": str(workspace_dir),
         "yaml_path": str(yaml_path),
         "exp_id": exp_id,
         "repo_name": repo_name,
@@ -93,7 +103,9 @@ def main() -> None:
         "apis_path": str(apis_path),
         "problems_path": str(problems_path),
         "docker_results_path": str(results_path),
-        "docker_logs_path": str(logs_path),
+        "docker_logs_path": str(docker_logs_path),
+        "run_logs_path": str(run_logs_path),
+        "plots_path": str(plots_path),
         "custom_pids_path": str(pids_path),
         "dataset_path": str(dataset_path),
     }
@@ -132,6 +144,7 @@ def main() -> None:
     if args.api:
         evaluate_lines.append(["--api", args.api])
     evaluate_lines.append(["--speedup_mode", "commit"])
+    evaluate_lines.append(["--output-dir", plots_path])
 
     dataset_lines: list[list[str | Path]] = [
         ["python", "src/gso/collect/build_dataset.py"],
@@ -142,14 +155,48 @@ def main() -> None:
         ["--debug"],
     ]
 
-    print("\n# Commands (run from repo_root)")
-    print(command("python", "src/gso/collect/analysis/commits.py", yaml_path))
-    print(command("python", "src/gso/collect/analysis/apis.py", repo_name))
-    print(continued_command(generate_lines))
-    print(command("docker", "image", "inspect", args.base_image))
-    print(continued_command(execute_lines))
-    print(continued_command(evaluate_lines))
-    print(continued_command(dataset_lines))
+    print("\n# Commands (run from repo_root in a shell supporting pipefail)")
+    print(command("mkdir", "-p", run_logs_path, plots_path))
+    print("set -o pipefail")
+    print(
+        logged_command(
+            command("python", "src/gso/collect/analysis/commits.py", yaml_path),
+            run_logs_path / "01-commits.log",
+        )
+    )
+    print(
+        logged_command(
+            command("python", "src/gso/collect/analysis/apis.py", repo_name),
+            run_logs_path / "02-apis.log",
+        )
+    )
+    print(
+        logged_command(
+            continued_command(generate_lines), run_logs_path / "03-generate.log"
+        )
+    )
+    print(
+        logged_command(
+            command("docker", "image", "inspect", args.base_image),
+            run_logs_path / "04-docker-preflight.log",
+        )
+    )
+    print(
+        logged_command(
+            continued_command(execute_lines), run_logs_path / "05-execute.log"
+        )
+    )
+    print(
+        logged_command(
+            continued_command(evaluate_lines), run_logs_path / "06-evaluate.log"
+        )
+    )
+    print(
+        logged_command(
+            continued_command(dataset_lines),
+            run_logs_path / "07-build-dataset.log",
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 ## Contents
 
-1. Preflight
+1. Repository workspace and preflight
 2. Experiment YAML
 3. Commit and API analysis
 4. Test generation
@@ -10,11 +10,21 @@
 6. Evaluation and selection
 7. Dataset build
 
-All commands run from the GSO repository root. The implementation stores data under `~/buckets/gso_bucket`; this location is currently fixed in `src/gso/constants.py`.
+All commands run from the GSO repository root. At the start of a task, derive `REPO_NAME` from the repository URL basename (removing an optional `.git`) and create a repository-scoped operator workspace:
 
-## 1. Preflight
+```bash
+workspace="$PWD/experiments/REPO_NAME"
+mkdir -p "$workspace/logs" "$workspace/plots"
+set -o pipefail
+```
 
-Inspect without exposing secret values:
+Store the experiment YAML, captured command output, plots, custom PID selection, and notes under this directory. Use stage-specific log names and add a timestamp or attempt suffix when prior logs must be retained. Every piped command below assumes `pipefail`, so a successful `tee` cannot hide a failed pipeline stage.
+
+GSO-generated problems, results, and detailed Docker runtime logs remain under `~/buckets/gso_bucket`; this location is currently fixed in `src/gso/constants.py`. Do not confuse `experiments/REPO_NAME/` in the GSO checkout with `~/buckets/gso_bucket/experiments/EXP_ID/`.
+
+## 1. Repository workspace and preflight
+
+Create the workspace before writing configuration or starting analysis, then inspect prerequisites without exposing secret values:
 
 ```bash
 test -d src/gso
@@ -34,6 +44,8 @@ If the YAML uses another `llm.api_key_env`, substitute that name. GSO loads `.en
 
 ## 2. Experiment YAML
 
+For a new task, copy the skill template to `$workspace/experiment.yaml` and replace every placeholder. Do not create the YAML at the GSO repository root.
+
 Required identity fields are `exp_id` and `repo_url`. Recommended local-Docker fields include `py_version`, `target_commit`, `install_commands`, and `repo_instr`. The `llm` mapping can include:
 
 - `model_name`
@@ -51,10 +63,12 @@ The config's `llm` values apply to analysis and generation. Explicit generation 
 ## 3. Commit and API analysis
 
 ```bash
-python src/gso/collect/analysis/commits.py /absolute/path/to/experiment.yaml \
-  --max_year 2021
+python src/gso/collect/analysis/commits.py "$workspace/experiment.yaml" \
+  --max_year 2021 \
+  2>&1 | tee "$workspace/logs/01-commits.log"
 
-python src/gso/collect/analysis/apis.py REPO_NAME
+python src/gso/collect/analysis/apis.py REPO_NAME \
+  2>&1 | tee "$workspace/logs/02-apis.log"
 ```
 
 Expected artifacts:
@@ -74,15 +88,17 @@ Before generation, inspect the analysis checkout's packaging and bootstrap files
 Generate all mapped APIs:
 
 ```bash
-python src/gso/collect/generate/generate.py /absolute/path/to/experiment.yaml
+python src/gso/collect/generate/generate.py "$workspace/experiment.yaml" \
+  2>&1 | tee "$workspace/logs/03-generate.log"
 ```
 
 Generate one exact API:
 
 ```bash
 python src/gso/collect/generate/generate.py \
-  /absolute/path/to/experiment.yaml \
-  --api package.target_api
+  "$workspace/experiment.yaml" \
+  --api package.target_api \
+  2>&1 | tee "$workspace/logs/03-generate-package.target_api.log"
 ```
 
 Expected artifact:
@@ -100,7 +116,8 @@ Generated problems contain YAML `install_commands` when configured. If the field
 Prefer the exact local analysis checkout:
 
 ```bash
-docker image inspect gso-base:ubuntu22.04-py312-uv0.5.4-amd64
+docker image inspect gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
+  2>&1 | tee "$workspace/logs/04-docker-preflight.log"
 test -d ~/buckets/gso_bucket/analysis/repos/REPO_NAME/.git
 
 python src/gso/collect/execute/execute.py \
@@ -110,7 +127,8 @@ python src/gso/collect/execute/execute.py \
   --docker-repo-path ~/buckets/gso_bucket/analysis/repos/REPO_NAME \
   --docker-image gso-EXP_ID:latest \
   --docker-platform linux/amd64 \
-  --machines 1
+  --machines 1 \
+  2>&1 | tee "$workspace/logs/05-execute.log"
 ```
 
 Add `--api package.target_api` to run one API. Add `--rebuild-docker-image` to append Docker's `--no-cache`. Optional controls include `--docker-cpus`, `--docker-memory`, `--runs`, `--keep-containers`, `--keep-workspaces`, and `--poll-interval`.
@@ -133,14 +151,16 @@ Expected artifacts:
 python src/gso/collect/execute/evaluate.py \
   --backend docker \
   --exp_id EXP_ID \
-  --speedup_mode commit
+  --speedup_mode commit \
+  --output-dir "$workspace/plots" \
+  2>&1 | tee "$workspace/logs/06-evaluate.log"
 ```
 
 Add `--api package.target_api` to narrow evaluation. Docker defaults to `commit` mode when `--speedup_mode` is omitted, but specify it for an auditable command.
 
-Evaluation writes plots under `plots/EXP_ID/docker` by default and prints the top `(pid, 7-character commit)` pairs. Select tasks based on stable repeated evidence, deterministic/equivalent results, reasonable duration, and meaningful parent-to-candidate speedup. Beware thermal throttling, background load, one-off outliers, I/O/network activity, and setup inside the timed region.
+The explicit `--output-dir` keeps plots under the repository workspace. Evaluation prints the top `(pid, 7-character commit)` pairs; its captured output stays in the workspace log. Select tasks based on stable repeated evidence, deterministic/equivalent results, reasonable duration, and meaningful parent-to-candidate speedup. Beware thermal throttling, background load, one-off outliers, I/O/network activity, and setup inside the timed region.
 
-Create `custom_pids.py` outside the shared source PID catalog:
+Create `$workspace/custom_pids.py` outside the shared source PID catalog:
 
 ```python
 TEST_PROBLEMS = {
@@ -160,9 +180,10 @@ Entries in `LONG_RUNNING_PROBLEMS` use `(pid, commit, max_test_count)`.
 python src/gso/collect/build_dataset.py \
   --backend docker \
   --exp_id EXP_ID \
-  --pids-file /absolute/path/to/custom_pids.py \
+  --pids-file "$workspace/custom_pids.py" \
   --dataset_name gso_EXP_ID \
-  --debug
+  --debug \
+  2>&1 | tee "$workspace/logs/07-build-dataset.log"
 ```
 
 Expected artifact:

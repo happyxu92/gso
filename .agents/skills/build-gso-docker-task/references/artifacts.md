@@ -9,8 +9,9 @@
 
 ## 1. Identity invariants
 
+- Operator-maintained task files use `${repo_root}/experiments/${repo_name}/`, where `repo_name` is derived from `repo_url`. New configurations, captured stage logs, plots, notes, and `custom_pids.py` belong there.
 - Analysis artifacts use `repo_name`, derived from `repo_url`.
-- Experiment artifacts use YAML `exp_id`.
+- GSO-generated experiment artifacts use YAML `exp_id` and remain under `~/buckets/gso_bucket/experiments/${exp_id}/`. The bucket directory is not the repository-scoped operator workspace.
 - Problem IDs generally combine the repository name and API, but must be copied exactly from generated/evaluated results.
 - Candidate selections use the exact 7-character value returned by `PerformanceCommit.quick_hash()`.
 - Docker results use `EXP_ID_results_docker.json`; Sky results use `EXP_ID_results.json`. Never silently mix them.
@@ -76,7 +77,7 @@ Before writing `custom_pids.py`, confirm each pair against the Docker evaluation
 Validate the custom file syntax and basic schema without executing arbitrary untrusted code:
 
 ```bash
-python -m py_compile /absolute/path/to/custom_pids.py
+python -m py_compile /absolute/path/to/gso/experiments/REPO_NAME/custom_pids.py
 ```
 
 `build_dataset.py` loads the file with `runpy.run_path`, so only use a file created or trusted by the user. It must define a non-empty `TEST_PROBLEMS` dictionary. `LONG_RUNNING_PROBLEMS` defaults to an empty list when omitted, but define it explicitly for clarity.
@@ -88,4 +89,5 @@ python -m py_compile /absolute/path/to/custom_pids.py
 - A single-API execution writes the common Docker results path. Inspect the file before assuming it still contains prior all-API results; use `--results-file` to preserve separate runs when needed.
 - Generation failures preserve an existing problems file, so verify its modification time and contents before executing.
 - Generation embeds `target_commit` and prefers YAML `install_commands`; when the field is absent it embeds the standard `Problem` commands. Review repository installation requirements and update the YAML before generation so the problems artifact is not stale.
-- Docker logs may persist across runs. Correlate task directories and timestamps with the current results file.
+- Captured stage output belongs in `experiments/REPO_NAME/logs/`; use timestamped or attempt-specific names when preserving retries.
+- GSO's detailed Docker logs may persist under `~/buckets/gso_bucket/experiments/EXP_ID/docker_logs/`. Correlate those task directories and timestamps with both the current results file and the captured execution log.
