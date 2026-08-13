@@ -1,0 +1,32 @@
+# Experiment identity and repository to analyze.
+exp_id: "REPLACE_EXP_ID"
+repo_url: "https://github.com/REPLACE_OWNER/REPLACE_REPOSITORY"
+
+# Optional: limit the newest matching candidate commits analyzed.
+# max_commits: 100
+
+llm:
+  model_name: "GLM-5.2"
+  base_url: "https://antchat.alipay.com/v1/"
+  api_key_env: "OPENAI_API_KEY"
+  multiprocess: 4
+  max_tokens: 32768
+  openai_timeout: 600
+  cache:
+    commit_filter: true
+    affected_files: true
+    api_identification: true
+
+api_docs: |
+  Focus on public Python APIs exposed by the repository.
+  Do not return private helpers or backend-only functions.
+
+py_version: "3.12"
+target_commit: "main"
+install_commands:
+  - "uv venv --python 3.12"
+  - "source .venv/bin/activate"
+  - "uv pip install -e ."
+
+repo_instr: |
+  Generate deterministic CPU-only workloads and keep setup outside the timed region.
