@@ -56,7 +56,7 @@ Required identity fields are `exp_id` and `repo_url`. Recommended local-Docker f
 - `openai_timeout`
 - `cache.commit_filter`, `cache.affected_files`, and `cache.api_identification`
 
-`api_docs` guides public API identification. `max_commits` is an optional positive top-level integer limiting the newest commit candidates.
+`api_docs` guides public API identification. Do not add a YAML `max_commits` field: the default single-repository workflow processes every matching commit after the year cutoff instead of truncating the candidate list.
 
 The config's `llm` values apply to analysis and generation. Explicit generation CLI values take precedence. Never store the key itself in YAML. Generation prefers YAML `install_commands`; when the field is absent, `Problem` supplies its standard commands.
 
@@ -64,7 +64,7 @@ The config's `llm` values apply to analysis and generation. Explicit generation 
 
 ```bash
 python src/gso/collect/analysis/commits.py "$workspace/experiment.yaml" \
-  --max_year 2021 \
+  --max_year 2022 \
   2>&1 | tee "$workspace/logs/01-commits.log"
 
 python src/gso/collect/analysis/apis.py REPO_NAME \
@@ -79,7 +79,7 @@ Expected artifacts:
 ~/buckets/gso_bucket/analysis/apis/REPO_NAME_ac_map.json
 ```
 
-`commits.py` reuses an existing analysis checkout; it does not automatically update it. `apis.py` takes the repository basename, not the experiment ID.
+`commits.py` reuses an existing analysis checkout; it does not automatically update it. Its `--max_year 2022` behavior excludes commits dated in 2022 or earlier, so the analysis covers every matching commit after 2022. Do not pass `--max-commits` or `--max_commits`. `apis.py` takes the repository basename, not the experiment ID.
 
 Before generation, inspect the analysis checkout's packaging and bootstrap files, such as `pyproject.toml`, `setup.py`, `setup.cfg`, requirements files, lockfiles, and contributor or CI installation instructions. Decide whether the current YAML commands install the repository and all runtime dependencies needed by generated tests. Typical reasons to customize them include required extras, a non-root package directory, native build prerequisites, editable-install limitations, or a repository-specific bootstrap command. If a change is needed, update the YAML first. If the YAML omits `install_commands` and the standard commands are sufficient, leave the field absent.
 
@@ -99,6 +99,7 @@ Generate all mapped APIs:
 
 ```bash
 python src/gso/collect/generate/generate.py "$workspace/experiment.yaml" \
+  --max_year 2022 \
   --docker-base-image gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
   --docker-repo-path ~/buckets/gso_bucket/analysis/repos/REPO_NAME \
   --docker-image gso-EXP_ID:latest \
@@ -112,6 +113,7 @@ Generate one exact API:
 python src/gso/collect/generate/generate.py \
   "$workspace/experiment.yaml" \
   --api package.target_api \
+  --max_year 2022 \
   --docker-base-image gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
   --docker-repo-path ~/buckets/gso_bucket/analysis/repos/REPO_NAME \
   --docker-image gso-EXP_ID:latest \
@@ -125,7 +127,7 @@ Expected artifact:
 ~/buckets/gso_bucket/experiments/EXP_ID/EXP_ID_problems.json
 ```
 
-The CLI is exposed through Fire. Useful generation overrides include `--model_name`, `--multiprocess`, `--n`, `--max_tokens`, `--openai_timeout`, `--max_year`, and `--min_loc`. Docker overrides include `--docker-image`, `--docker-base-image`, `--docker-repo-path`, `--docker-cpus`, `--docker-memory`, `--docker-platform`, `--rebuild-docker-image`, `--keep-containers`, and `--keep-workspaces`.
+The CLI is exposed through Fire. Keep generation's `--max_year` equal to the analysis cutoff; the default is `2022`. Other useful generation overrides include `--model_name`, `--multiprocess`, `--n`, `--max_tokens`, `--openai_timeout`, and `--min_loc`. Docker overrides include `--docker-image`, `--docker-base-image`, `--docker-repo-path`, `--docker-cpus`, `--docker-memory`, `--docker-platform`, `--rebuild-docker-image`, `--keep-containers`, and `--keep-workspaces`.
 
 Generation behavior is sequential within each commit and parallel across commits:
 

@@ -13,6 +13,7 @@ import yaml
 
 
 DEFAULT_BASE_IMAGE = "gso-base:ubuntu22.04-py312-uv0.5.4-amd64"
+DEFAULT_MAX_YEAR = 2022
 
 
 def quote(value: str | Path) -> str:
@@ -52,6 +53,12 @@ def main() -> None:
         "--api", help="Render generation/execution/evaluation for one API"
     )
     parser.add_argument("--base-image", default=DEFAULT_BASE_IMAGE)
+    parser.add_argument(
+        "--max-year",
+        type=int,
+        default=DEFAULT_MAX_YEAR,
+        help="Commit year cutoff passed to analysis and generation (default: 2022)",
+    )
     parser.add_argument("--docker-platform", default="linux/amd64")
     parser.add_argument("--rebuild-docker-image", action="store_true")
     args = parser.parse_args()
@@ -116,7 +123,8 @@ def main() -> None:
     print(json.dumps(paths, indent=2, ensure_ascii=False))
 
     generate_lines: list[list[str | Path]] = [
-        ["python", "src/gso/collect/generate/generate.py", yaml_path]
+        ["python", "src/gso/collect/generate/generate.py", yaml_path],
+        ["--max_year", str(args.max_year)],
     ]
     if args.api:
         generate_lines.append(["--api", args.api])
@@ -174,7 +182,13 @@ def main() -> None:
     print("set -o pipefail")
     print(
         logged_command(
-            command("python", "src/gso/collect/analysis/commits.py", yaml_path),
+            command(
+                "python",
+                "src/gso/collect/analysis/commits.py",
+                yaml_path,
+                "--max_year",
+                str(args.max_year),
+            ),
             run_logs_path / "01-commits.log",
         )
     )

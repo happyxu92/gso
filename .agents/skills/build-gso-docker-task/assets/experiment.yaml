@@ -2,9 +2,6 @@
 exp_id: "REPLACE_EXP_ID"
 repo_url: "https://github.com/REPLACE_OWNER/REPLACE_REPOSITORY"
 
-# Optional: limit the newest matching candidate commits analyzed.
-# max_commits: 100
-
 llm:
   model_name: "codex/gpt-5.6-sol-high"
   base_url: "https://irvine.binzi.website:3456/v1"
