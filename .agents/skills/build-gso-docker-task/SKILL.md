@@ -5,7 +5,7 @@ description: Build and validate a GSO performance-optimization task for a Python
 
 # Build a GSO Docker Task
 
-Build one repository at a time and treat every stage as a checkpoint. Run commands from the GSO repository root. Default to the local checkout at `third/gso` only when it exists; otherwise discover the root from the user's context or ask for it. Unless the user explicitly chooses another cutoff, analyze and generate tasks for every matching commit after 2022 by passing `--max_year 2022`; do not cap the commit count with `--max-commits`, `--max_commits`, or YAML `max_commits`.
+Build one repository at a time and treat every stage as a checkpoint. Run commands from the GSO repository root. Default the GSO repository root to `~/gso`; use another root only when the user explicitly provides one. Unless the user explicitly chooses another cutoff, analyze and generate tasks for every matching commit after 2022 by passing `--max_year 2022`; do not cap the commit count with `--max-commits`, `--max_commits`, or YAML `max_commits`.
 
 For every new repository task, first create a repository-scoped operator workspace at `experiments/${repo_name}/`. Put the experiment YAML, captured command logs, evaluation plots, `custom_pids.py`, notes, and other task-maintained files there. This workspace is distinct from GSO's generated artifact directory at `~/buckets/gso_bucket/experiments/${exp_id}/`, which remains fixed by `src/gso/constants.py`.
 
