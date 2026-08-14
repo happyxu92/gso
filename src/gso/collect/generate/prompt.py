@@ -120,45 +120,40 @@ PR_INFO = """
 """
 
 
-SCENARIO_SYSTEM_MSG = """You are a performance-test scenario planner. Analyze the repository API and optimization commit supplied by the user, then design realistic scenarios that can each be implemented as one standalone performance test.
-
-Do not write Python code. Return exactly one JSON object in the requested format and no explanatory text or Markdown.
-"""
-
-SCENARIO_TASK_MSG = """Design exactly {num_scenarios} materially distinct performance-test scenarios for the `{api}` API in the `{repo_name}` repository.
+SCENARIO_TEST_MSG = """Design exactly one new performance-test scenario for the `{api}` API in the `{repo_name}` repository, then implement that scenario as the one complete Python performance test requested by the system instructions.
 
 Requirements:
-1. Every scenario must exercise the target API and be relevant to the supplied optimization commit.
-2. Every scenario must describe one realistic, non-trivial workload whose setup is kept outside the timed experiment.
-3. Vary meaningful workload properties such as input structure, data distribution, scale, API usage path, or optimized behavior. Do not create scenarios that differ only by arbitrary parameter values.
+1. The scenario and test must exercise the target API and be relevant to the supplied optimization commit.
+2. The scenario must describe the exact realistic, non-trivial workload implemented by the test, with setup kept outside the timed experiment.
+3. The new scenario must differ materially from every successful scenario listed below in input structure, data distribution, scale, API usage path, or optimized behavior. Do not vary only arbitrary parameter values.
 4. Use reproducible inputs and avoid uniform, sorted, repeating, or easily hackable patterns.
-5. Make every scenario self-contained and detailed enough for another model request to turn it into a complete test.
+5. Keep the scenario and implementation consistent; do not describe one workload and implement another.
 6. Describe how the result can be stored and compared with a reference result.
 
-Return this exact JSON shape:
+Return exactly two fenced blocks and no explanatory text before, between, or after them.
+
+First, return one `json` block with this exact shape:
+```json
 {{
-  "scenarios": [
-    {{
-      "title": "short scenario name",
-      "workload": "realistic operation and data setup",
-      "input_characteristics": "input structure, distribution, and scale",
-      "api_usage": "how the target API is exercised",
-      "optimization_focus": "commit behavior this scenario measures",
-      "equivalence_strategy": "what result is stored and compared",
-      "distinguishing_factor": "how this differs materially from the other scenarios"
-    }}
-  ]
+  "title": "short scenario name",
+  "workload": "realistic operation and data setup",
+  "input_characteristics": "input structure, distribution, and scale",
+  "api_usage": "how the target API is exercised",
+  "optimization_focus": "commit behavior this scenario measures",
+  "equivalence_strategy": "what result is stored and compared",
+  "distinguishing_factor": "how this differs materially from previous successful scenarios"
 }}
+```
 
-The `scenarios` array must contain exactly {num_scenarios} objects.
-"""
+Second, return one `python` block containing the complete test implementation with every required function:
+```python
+# complete test implementation
+```
 
-SCENARIO_TEST_MSG = """Implement the selected performance-test scenario below as the one complete Python test requested by the system instructions.
+This is test {scenario_number} of {scenario_count}.
 
-This is scenario {scenario_number} of {scenario_count}. Follow this scenario rather than inventing a different workload, and return only one test implementation.
-
-Selected scenario:
-{scenario_json}
+Previously generated and successfully executed scenarios:
+{previous_scenarios}
 """
 
 

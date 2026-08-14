@@ -195,6 +195,67 @@ def get_generated_scenarios(
     return scenarios
 
 
+def get_generated_scenario_and_test(
+    output: str, *, context: str = "scenario/test response"
+) -> tuple[TestScenario, str]:
+    """Parse one scenario JSON block and one Python test block from a response."""
+    if not isinstance(output, str) or not output.strip():
+        raise GeneratedScenarioError(f"{context}: model returned an empty response")
+    if output.count("```") != 4:
+        raise GeneratedScenarioError(
+            f"{context}: expected exactly two closed fenced blocks"
+        )
+    matches = list(_CODE_FENCE_RE.finditer(output))
+    json_matches = [
+        match for match in matches if match.group("language").strip().lower() == "json"
+    ]
+    python_matches = [
+        match
+        for match in matches
+        if match.group("language").strip().lower() in {"py", "python", "python3"}
+    ]
+    if len(matches) != 2 or len(json_matches) != 1 or len(python_matches) != 1:
+        raise GeneratedScenarioError(
+            f"{context}: expected one JSON block and one Python block"
+        )
+    if matches[0] is not json_matches[0] or matches[1] is not python_matches[0]:
+        raise GeneratedScenarioError(
+            f"{context}: JSON block must appear before the Python block"
+        )
+
+    content = extract_json_block(output, context=context)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise GeneratedScenarioError(
+            f"{context}: invalid JSON at line {exc.lineno}, column {exc.colno}: "
+            f"{exc.msg}"
+        ) from exc
+
+    # Accept the old one-element wrapper while cached completions age out, but
+    # normalize immediately to the new single-scenario contract.
+    if isinstance(parsed, dict) and "scenarios" in parsed:
+        raw_scenarios = parsed["scenarios"]
+        if not isinstance(raw_scenarios, list) or len(raw_scenarios) != 1:
+            count = (
+                len(raw_scenarios) if isinstance(raw_scenarios, list) else "non-list"
+            )
+            raise GeneratedScenarioError(
+                f"{context}: expected exactly one scenario, got {count}"
+            )
+        parsed = raw_scenarios[0]
+
+    try:
+        scenario = TestScenario.model_validate(parsed)
+    except ValidationError as exc:
+        raise GeneratedScenarioError(
+            f"{context}: invalid scenario structure: {exc}"
+        ) from exc
+
+    test = get_generated_test(output, context=context)
+    return scenario, test
+
+
 def extract_codeblock(output: str, *, context: str = "model response") -> str:
     """Extract Python from a completion without silently accepting truncation."""
     if not isinstance(output, str) or not output.strip():

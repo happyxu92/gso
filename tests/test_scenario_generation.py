@@ -8,11 +8,17 @@ from r2e.llms.llm_args import LLMArgs
 from gso.collect.generate.args import PerfExpGenArgs
 from gso.collect.generate.generate import (
     CommitGenerationTask,
+    SEMANTIC_RETRY_COUNT,
     create_generation_problem,
     generate_commit_tests,
 )
+from gso.collect.execute.execute import (
+    GeneratedTestExecutionConfig,
+    GeneratedTestExecutionResult,
+)
 from gso.collect.generate.helpers import (
     GeneratedScenarioError,
+    get_generated_scenario_and_test,
     get_generated_scenarios,
 )
 from gso.data import PerformanceCommit, Problem, Repo, Tests as CommitTests
@@ -55,6 +61,10 @@ def check_equivalence(reference, current):
 def run_test(eqcheck=False, reference=False, prefix=''):
     return 0.0
 """
+
+
+def combined_output(scenario=SCENARIO_TEMPLATE, test=VALID_TEST):
+    return f"```json\n{json.dumps(scenario)}\n```\n\n```python\n{test}\n```"
 
 
 def test_generation_defaults_to_four_commit_workers_and_five_tests():
@@ -119,6 +129,26 @@ def test_generated_scenarios_require_expected_count_and_fields():
     del scenarios[0]["workload"]
     with pytest.raises(GeneratedScenarioError, match="invalid scenario structure"):
         get_generated_scenarios(json.dumps({"scenarios": scenarios}), expected_count=2)
+
+
+def test_generated_scenario_and_test_are_parsed_from_one_completion():
+    scenario, test = get_generated_scenario_and_test(combined_output())
+
+    assert scenario.title == "scenario"
+    assert test == VALID_TEST.strip()
+
+    with pytest.raises(GeneratedScenarioError, match="invalid scenario structure"):
+        get_generated_scenario_and_test(combined_output({"title": "incomplete"}))
+
+    with pytest.raises(GeneratedScenarioError, match="exactly two closed fenced"):
+        get_generated_scenario_and_test(json.dumps(SCENARIO_TEMPLATE))
+
+    reversed_blocks = (
+        f"```python\n{VALID_TEST}\n```\n"
+        f"```json\n{json.dumps(SCENARIO_TEMPLATE)}\n```"
+    )
+    with pytest.raises(GeneratedScenarioError, match="JSON block must appear before"):
+        get_generated_scenario_and_test(reversed_blocks)
 
 
 def test_streaming_runner_uses_one_choice_even_when_test_count_is_larger():
@@ -200,7 +230,7 @@ def test_single_completion_disables_payload_level_parallelism(monkeypatch):
     }
 
 
-def test_commit_worker_generates_scenarios_then_tests_sequentially(monkeypatch):
+def test_commit_worker_generates_scenario_and_test_together(monkeypatch):
     repo = Repo(
         repo_url="https://github.com/example/repo",
         repo_owner="example",
@@ -227,15 +257,12 @@ def test_commit_worker_generates_scenarios_then_tests_sequentially(monkeypatch):
         commit_tests.init_chat("test system", "commit context", "write test")
         return commit_tests
 
-    scenario_output = json.dumps(
-        {
-            "scenarios": [
-                {**SCENARIO_TEMPLATE, "title": "first"},
-                {**SCENARIO_TEMPLATE, "title": "second"},
-            ]
-        }
+    responses = iter(
+        [
+            combined_output({**SCENARIO_TEMPLATE, "title": "first"}),
+            combined_output({**SCENARIO_TEMPLATE, "title": "second"}),
+        ]
     )
-    responses = iter([scenario_output, VALID_TEST, VALID_TEST])
     payloads = []
 
     def fake_completion(request_args, payload):
@@ -262,14 +289,15 @@ def test_commit_worker_generates_scenarios_then_tests_sequentially(monkeypatch):
     assert result.error is None
     assert result.commit_tests is not None
     assert result.commit_tests.num_samples() == 2
-    assert len(payloads) == 3
-    assert payloads[0][0]["content"].startswith(
-        "You are a performance-test scenario planner"
-    )
+    assert len(payloads) == 2
+    assert payloads[0][0]["content"] == "test system"
+    assert "exactly two fenced blocks" in payloads[0][-1]["content"]
     assert '"title":"first"' in payloads[1][-1]["content"].replace(" ", "")
-    assert '"title":"second"' in payloads[2][-1]["content"].replace(" ", "")
     # Duplicate test code is intentionally accepted; no deduplication is performed.
-    assert result.test_outputs == [VALID_TEST, VALID_TEST]
+    assert len(result.test_outputs) == 2
+    assert result.commit_tests.samples[0].startswith("# GSO generated scenario:")
+    assert "# title: first" in result.commit_tests.samples[0]
+    assert "# title: second" in result.commit_tests.samples[1]
 
 
 def test_commit_worker_retries_invalid_scenario_without_cache(monkeypatch):
@@ -298,9 +326,11 @@ def test_commit_worker_retries_invalid_scenario_without_cache(monkeypatch):
         commit_tests.init_chat("test system", "commit context", "write test")
         return commit_tests
 
-    invalid_scenario = '{"scenarios": [{"title": "broken", "workload": unquoted}]}'
-    valid_scenario = json.dumps({"scenarios": [SCENARIO_TEMPLATE]})
-    responses = iter([invalid_scenario, valid_scenario, VALID_TEST])
+    invalid_scenario = (
+        '```json\n{"title": "broken", "workload": unquoted}\n```\n'
+        f"```python\n{VALID_TEST}\n```"
+    )
+    responses = iter([invalid_scenario, combined_output()])
     calls = []
 
     def fake_completion(request_args, payload):
@@ -327,7 +357,7 @@ def test_commit_worker_retries_invalid_scenario_without_cache(monkeypatch):
     assert result.error is None
     assert result.commit_tests is not None
     assert result.commit_tests.num_samples() == 1
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert calls[0][0].use_cache is True
     assert calls[1][0].use_cache is False
     retry_instruction = calls[1][1][-1]["content"]
@@ -361,9 +391,9 @@ def test_commit_worker_retries_invalid_test_without_cache(monkeypatch):
         commit_tests.init_chat("test system", "commit context", "write test")
         return commit_tests
 
-    scenario_output = json.dumps({"scenarios": [SCENARIO_TEMPLATE]})
     invalid_test = "```python\nimport timeit\n```"
-    responses = iter([scenario_output, invalid_test, VALID_TEST])
+    invalid_output = f"```json\n{json.dumps(SCENARIO_TEMPLATE)}\n```\n{invalid_test}"
+    responses = iter([invalid_output, combined_output()])
     calls = []
 
     def fake_completion(request_args, payload):
@@ -390,9 +420,145 @@ def test_commit_worker_retries_invalid_test_without_cache(monkeypatch):
     assert result.error is None
     assert result.commit_tests is not None
     assert result.commit_tests.num_samples() == 1
-    assert result.test_outputs == [invalid_test, VALID_TEST]
-    assert calls[1][0].use_cache is True
-    assert calls[2][0].use_cache is False
-    retry_instruction = calls[2][1][-1]["content"]
+    assert result.test_outputs == [invalid_output, combined_output()]
+    assert calls[0][0].use_cache is True
+    assert calls[1][0].use_cache is False
+    retry_instruction = calls[1][1][-1]["content"]
     assert "semantic retry 1 of 3" in retry_instruction
     assert "missing required function" in retry_instruction
+
+
+def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commit = PerformanceCommit(
+        commit_hash="abcdef1234567890",
+        subject="Optimize target API",
+        message="Optimize target API",
+        date="2024-01-01T00:00:00",
+    )
+    problem = Problem(pid="repo.target", repo=repo, api="target", commits=[commit])
+    args = PerfExpGenArgs(
+        yaml_path="unused.yaml",
+        model_name="custom-model",
+        n=1,
+        use_cache=True,
+    )
+
+    def fake_prepare(task_args):
+        _, _, prepared_commit, _ = task_args
+        commit_tests = CommitTests.from_commit(prepared_commit)
+        commit_tests.init_chat("test system", "commit context", "write test")
+        return commit_tests
+
+    responses = iter([combined_output(), combined_output()])
+    completion_calls = []
+    execution_calls = []
+
+    def fake_completion(request_args, payload):
+        completion_calls.append((request_args, payload))
+        return next(responses)
+
+    def fake_evaluate(problem_arg, commit_arg, test_arg, config_arg):
+        execution_calls.append(test_arg)
+        if len(execution_calls) == 1:
+            return GeneratedTestExecutionResult(
+                passed=False,
+                error="AssertionError: candidate output differs from reference",
+                log_path="/tmp/test-execution.log",
+            )
+        return GeneratedTestExecutionResult(passed=True)
+
+    monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.get_streaming_llm_completion",
+        fake_completion,
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.evaluate_generated_test", fake_evaluate
+    )
+
+    result = generate_commit_tests(
+        CommitGenerationTask(
+            problem_index=0,
+            commit_index=0,
+            repo=repo,
+            problem=problem,
+            commit=commit,
+            args=args,
+            execution_config=GeneratedTestExecutionConfig(exp_id="repo"),
+        )
+    )
+
+    assert result.error is None
+    assert len(execution_calls) == 2
+    assert result.test_attempts[0]["error"].endswith(
+        "AssertionError: candidate output differs from reference"
+    )
+    assert result.test_attempts[0]["execution_log"] == "/tmp/test-execution.log"
+    assert result.test_attempts[1]["error"] is None
+    retry_instruction = completion_calls[1][1][-1]["content"]
+    assert "semantic retry 1 of 3" in retry_instruction
+    assert "candidate output differs from reference" in retry_instruction
+
+
+def test_commit_worker_stops_after_three_execution_retries(monkeypatch):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commit = PerformanceCommit(
+        commit_hash="abcdef1234567890",
+        subject="Optimize target API",
+        message="Optimize target API",
+        date="2024-01-01T00:00:00",
+    )
+    problem = Problem(pid="repo.target", repo=repo, api="target", commits=[commit])
+    args = PerfExpGenArgs(yaml_path="unused.yaml", model_name="custom-model", n=1)
+
+    def fake_prepare(task_args):
+        _, _, prepared_commit, _ = task_args
+        commit_tests = CommitTests.from_commit(prepared_commit)
+        commit_tests.init_chat("test system", "commit context", "write test")
+        return commit_tests
+
+    responses = iter(
+        [
+            *([combined_output()] * (SEMANTIC_RETRY_COUNT + 1)),
+        ]
+    )
+    execution_count = 0
+
+    def fake_evaluate(*args):
+        nonlocal execution_count
+        execution_count += 1
+        return GeneratedTestExecutionResult(passed=False, error="always fails")
+
+    monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.get_streaming_llm_completion",
+        lambda request_args, payload: next(responses),
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.evaluate_generated_test", fake_evaluate
+    )
+
+    result = generate_commit_tests(
+        CommitGenerationTask(
+            problem_index=0,
+            commit_index=0,
+            repo=repo,
+            problem=problem,
+            commit=commit,
+            args=args,
+            execution_config=GeneratedTestExecutionConfig(exp_id="repo"),
+        )
+    )
+
+    assert execution_count == SEMANTIC_RETRY_COUNT + 1
+    assert len(result.test_attempts) == SEMANTIC_RETRY_COUNT + 1
+    assert "always fails" in result.error

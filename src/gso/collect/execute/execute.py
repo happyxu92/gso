@@ -16,7 +16,7 @@ from gso.collect.execute.helpers import resolve_results_path
 from gso.collect.execute.skymgr import SkyManager
 from gso.collect.generate.helpers import validate_problem_test_samples
 from gso.constants import EXPS_DIR
-from gso.data import Problem
+from gso.data import PerformanceCommit, Problem, Tests
 from gso.utils.io import load_problems, save_problems
 
 
@@ -34,6 +34,33 @@ class TaskState:
     failed: bool = False
     error: str | None = None
     status_errors: int = 0
+
+
+@dataclass(frozen=True)
+class GeneratedTestExecutionConfig:
+    """Execution settings used while validating tests during generation."""
+
+    exp_id: str
+    backend: str = "docker"
+    docker_image: str | None = None
+    docker_cpus: float | None = None
+    docker_memory: str | None = None
+    docker_platform: str | None = None
+    docker_base_image: str | None = None
+    docker_repo_path: str | None = None
+    rebuild_docker_image: bool = False
+    keep_containers: bool = False
+    keep_workspaces: bool = False
+    poll_interval: float | None = None
+
+
+@dataclass(frozen=True)
+class GeneratedTestExecutionResult:
+    """Result returned to the generator after executing one candidate test."""
+
+    passed: bool
+    error: str | None = None
+    log_path: str | None = None
 
 
 class ExecutionManager:
@@ -348,6 +375,187 @@ class ExecutionManager:
                 for state in failures
             )
             raise RuntimeError(f"{len(failures)} task(s) failed: {details}")
+
+
+def _create_runtime(config: GeneratedTestExecutionConfig, exp_dir: Path):
+    """Create the execution backend shared by batch and generation validation."""
+    if config.backend == "docker":
+        return DockerManager(
+            image=config.docker_image or f"gso-{config.exp_id}:latest",
+            artifact_dir=exp_dir / "docker_logs" / "generation_validation",
+            cpus=config.docker_cpus,
+            memory=config.docker_memory,
+            platform=config.docker_platform,
+            keep_containers=config.keep_containers,
+            repository_base_image=config.docker_base_image,
+            repository_path=(
+                Path(config.docker_repo_path).expanduser()
+                if config.docker_repo_path
+                else None
+            ),
+            rebuild_repository_image=config.rebuild_docker_image,
+        )
+    if config.backend == "sky":
+        return SkyManager()
+    raise ValueError("backend must be 'sky' or 'docker'")
+
+
+def prepare_generated_test_execution(
+    problems: list[Problem], config: GeneratedTestExecutionConfig
+) -> GeneratedTestExecutionConfig:
+    """Prepare the backend once, then return settings safe for per-test workers."""
+    exp_dir = EXPS_DIR / config.exp_id
+    runtime = _create_runtime(config, exp_dir)
+
+    # Docker validation discovers candidate revisions through Problem.tests. At
+    # this point generation has not produced tests yet, so create commit-only
+    # placeholders solely for the image/commit preflight.
+    validation_problems = []
+    for problem in problems:
+        validation_problem = problem.model_copy(deep=True)
+        validation_problem.set_tests(
+            [Tests.from_commit(commit) for commit in validation_problem.commits]
+        )
+        validation_problems.append(validation_problem)
+    runtime.validate(validation_problems)
+
+    # The repository image is now ready. Per-test workers must reuse it rather
+    # than racing to rebuild the same tag for every generated sample.
+    if config.backend == "docker" and config.docker_base_image is not None:
+        return GeneratedTestExecutionConfig(
+            **{
+                **config.__dict__,
+                "docker_base_image": None,
+                "docker_repo_path": None,
+                "rebuild_docker_image": False,
+            }
+        )
+    return config
+
+
+def _execution_error_detail(
+    manager: ExecutionManager, runtime, manager_error: Exception | None
+) -> tuple[str, str | None]:
+    """Collect concise backend diagnostics suitable for an LLM retry prompt."""
+    details = []
+    if manager_error is not None:
+        details.append(str(manager_error))
+    for state in manager.tasks.values():
+        if state.error:
+            details.append(state.error)
+
+    log_path = None
+    artifact_dir = getattr(runtime, "artifact_dir", None)
+    if artifact_dir is not None:
+        for state in manager.tasks.values():
+            candidate = Path(artifact_dir) / f"{state.cluster}.log"
+            if not candidate.exists():
+                continue
+            log_path = str(candidate)
+            log_text = candidate.read_text(encoding="utf-8", errors="replace")
+            if log_text.strip():
+                details.append(f"Execution log tail:\n{log_text[-12000:]}")
+
+    if not details:
+        details.append(
+            "The test did not produce a successful candidate-commit result. "
+            "It may have failed setup, reference execution, or equivalence checking."
+        )
+    return "\n\n".join(details), log_path
+
+
+async def _async_evaluate_generated_test(
+    problem: Problem,
+    commit: PerformanceCommit,
+    generated_test: str,
+    config: GeneratedTestExecutionConfig,
+) -> GeneratedTestExecutionResult:
+    """Execute one generated test against a commit parent and candidate."""
+    try:
+        validation_problem = problem.model_copy(deep=True)
+        validation_problem.commits = [commit]
+        commit_tests = Tests.from_commit(commit)
+        commit_tests.add_sample(generated_test)
+        validation_problem.set_tests([commit_tests])
+        validation_problem.clear_results()
+        validate_problem_test_samples([validation_problem])
+
+        exp_dir = EXPS_DIR / config.exp_id
+        runtime = _create_runtime(config, exp_dir)
+        runtime.validate([validation_problem])
+    except Exception as exc:
+        return GeneratedTestExecutionResult(
+            passed=False,
+            error=(
+                "Execution backend validation failed: " f"{type(exc).__name__}: {exc}"
+            ),
+        )
+    effective_poll_interval = (
+        (1 if config.backend == "docker" else 5)
+        if config.poll_interval is None
+        else config.poll_interval
+    )
+
+    # This file is diagnostic-only and remains separate from formal batch results.
+    # A unique name also prevents parallel commit workers from overwriting it.
+    results_path = (
+        exp_dir
+        / "generation_validation"
+        / f"{problem.pid}_{commit.quick_hash()}_{uuid.uuid4().hex[:8]}.json"
+    )
+    manager = ExecutionManager(
+        exp_id=config.exp_id,
+        exp_dir=exp_dir,
+        problems=[validation_problem],
+        machines=1,
+        runs=1,
+        runtime=runtime,
+        results_path=results_path,
+        poll_interval=effective_poll_interval,
+        keep_workspaces=config.keep_workspaces,
+    )
+    manager_error = None
+    try:
+        manager.initialize_problems()
+        await manager.run()
+    except Exception as exc:
+        manager_error = exc
+        if not manager.tasks:
+            try:
+                manager.thread_pool.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
+
+    collected_results = [
+        result
+        for run_results in validation_problem.results.values()
+        for result in run_results
+    ]
+    passed = any(
+        result.get("commit") == commit.commit_hash
+        and "base_result" in result
+        and "commit_result" in result
+        and result.get("base_result") is not None
+        and result.get("commit_result") is not None
+        for result in collected_results
+    )
+    if passed and manager_error is None:
+        return GeneratedTestExecutionResult(passed=True)
+
+    error, log_path = _execution_error_detail(manager, runtime, manager_error)
+    return GeneratedTestExecutionResult(passed=False, error=error, log_path=log_path)
+
+
+def evaluate_generated_test(
+    problem: Problem,
+    commit: PerformanceCommit,
+    generated_test: str,
+    config: GeneratedTestExecutionConfig,
+) -> GeneratedTestExecutionResult:
+    """Synchronous entry point used by generation workers."""
+    return asyncio.run(
+        _async_evaluate_generated_test(problem, commit, generated_test, config)
+    )
 
 
 async def async_main(

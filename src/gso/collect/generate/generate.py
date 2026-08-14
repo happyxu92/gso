@@ -12,7 +12,12 @@ import fire
 from r2e.multiprocess import run_tasks_in_parallel
 from gso.data import PerformanceCommit, Problem, Repo, Tests
 from gso.logger import logger
-from gso.constants import EXPS_DIR, ANALYSIS_APIS_DIR
+from gso.constants import ANALYSIS_APIS_DIR, ANALYSIS_REPOS_DIR, EXPS_DIR
+from gso.collect.execute.execute import (
+    GeneratedTestExecutionConfig,
+    evaluate_generated_test,
+    prepare_generated_test_execution,
+)
 
 from gso.utils.io import *
 from gso.utils.llm import (
@@ -47,6 +52,7 @@ class CommitGenerationTask:
     problem: Problem
     commit: PerformanceCommit
     args: PerfExpGenArgs
+    execution_config: GeneratedTestExecutionConfig | None = None
 
 
 @dataclass
@@ -58,20 +64,40 @@ class CommitGenerationResult:
     pid: str
     commit_hash: str
     commit_tests: Tests | None = None
-    scenario_output: str | None = None
     scenarios: list[dict[str, str]] = field(default_factory=list)
     test_outputs: list[str] = field(default_factory=list)
+    test_attempts: list[dict] = field(default_factory=list)
     error: str | None = None
 
     def diagnostic(self) -> dict:
         return {
             "pid": self.pid,
             "commit_hash": self.commit_hash,
-            "scenario_output": self.scenario_output,
             "scenarios": self.scenarios,
             "test_outputs": self.test_outputs,
+            "test_attempts": self.test_attempts,
             "error": self.error,
         }
+
+
+def format_previous_scenarios(scenarios: list[TestScenario]) -> str:
+    """Format only successfully executed scenarios for the next LLM request."""
+    if not scenarios:
+        return "None. This is the first scenario."
+    return json.dumps(
+        [scenario.model_dump() for scenario in scenarios],
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+def add_scenario_comment(test: str, scenario: TestScenario) -> str:
+    """Persist the scenario alongside its generated test as Python comments."""
+    lines = ["# GSO generated scenario:"]
+    for name, value in scenario.model_dump().items():
+        normalized = " ".join(value.split())
+        lines.append(f"# {name}: {normalized}")
+    return "\n".join(lines) + "\n\n" + test.lstrip()
 
 
 def prepare_model_payload(
@@ -118,7 +144,7 @@ def _prepare_semantic_retry(
 
 
 def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
-    """Generate one scenario plan and its tests sequentially for a commit."""
+    """Generate, execute, and accept one scenario/test at a time for a commit."""
     result = CommitGenerationResult(
         problem_index=task.problem_index,
         commit_index=task.commit_index,
@@ -128,105 +154,89 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
 
     try:
         commit_tests = prepare_mp_helper((task.repo, task.problem, task.commit, False))
-        context_message = commit_tests.chat_messages[1]
-        scenario_task = SCENARIO_TASK_MSG.format(
-            num_scenarios=task.args.n,
-            api=task.problem.api,
-            repo_name=task.repo.repo_name,
-        )
-        if task.repo.repo_instr:
-            scenario_task += (
-                "\n\nRepo-specific Instructions:\n" f"{task.repo.repo_instr}\n"
-            )
-        scenario_messages = [
-            {"role": "system", "content": SCENARIO_SYSTEM_MSG},
-            dict(context_message),
-            {"role": "user", "content": scenario_task},
-        ]
-        scenario_payload = prepare_model_payload(
-            task.args.model_name, scenario_messages
-        )
-        scenario_context = (
-            f"{task.problem.pid}/{task.commit.quick_hash()} scenario plan"
-        )
-        scenario_error: GeneratedScenarioError | None = None
-        for retry_number in range(SEMANTIC_RETRY_COUNT + 1):
-            request_args, attempt_payload = _prepare_semantic_retry(
-                task.args,
-                scenario_payload,
-                retry_number=retry_number,
-                previous_error=scenario_error,
-                output_requirement=(
-                    "Return only one valid JSON object with every string value "
-                    "double-quoted, and do not include Markdown or explanations."
-                ),
-            )
-            result.scenario_output = get_streaming_llm_completion(
-                request_args, attempt_payload
-            )
-            try:
-                scenarios = get_generated_scenarios(
-                    result.scenario_output,
-                    expected_count=task.args.n,
-                    context=scenario_context,
-                )
-            except GeneratedScenarioError as error:
-                if retry_number == SEMANTIC_RETRY_COUNT:
-                    error.add_note(
-                        f"Failed after the initial request and "
-                        f"{SEMANTIC_RETRY_COUNT} semantic retries."
-                    )
-                    raise
-                logger.warning(
-                    "%s failed validation; semantic retry %d/%d: %s",
-                    scenario_context,
-                    retry_number + 1,
-                    SEMANTIC_RETRY_COUNT,
-                    error,
-                )
-                scenario_error = error
-                continue
-            break
-        result.scenarios = [scenario.model_dump() for scenario in scenarios]
-
         generated_tests = []
-        for scenario_index, scenario in enumerate(scenarios, start=1):
-            test_messages = [dict(message) for message in commit_tests.chat_messages]
-            test_messages.append(
-                {
-                    "role": "user",
-                    "content": SCENARIO_TEST_MSG.format(
-                        scenario_number=scenario_index,
-                        scenario_count=len(scenarios),
-                        scenario_json=scenario.model_dump_json(indent=2),
-                    ),
-                }
+        successful_scenarios: list[TestScenario] = []
+        for scenario_index in range(1, task.args.n + 1):
+            combined_task = SCENARIO_TEST_MSG.format(
+                api=task.problem.api,
+                repo_name=task.repo.repo_name,
+                scenario_number=scenario_index,
+                scenario_count=task.args.n,
+                previous_scenarios=format_previous_scenarios(successful_scenarios),
             )
-            test_payload = prepare_model_payload(task.args.model_name, test_messages)
+            if task.repo.repo_instr:
+                combined_task += (
+                    "\n\nRepo-specific Instructions:\n" f"{task.repo.repo_instr}\n"
+                )
+            combined_messages = [
+                *[dict(message) for message in commit_tests.chat_messages],
+                {"role": "user", "content": combined_task},
+            ]
+            combined_payload = prepare_model_payload(
+                task.args.model_name, combined_messages
+            )
             test_context = (
                 f"{task.problem.pid}/{task.commit.quick_hash()} "
-                f"scenario {scenario_index} test"
+                f"scenario/test {scenario_index}"
             )
             test_error: GeneratedTestError | None = None
             for retry_number in range(SEMANTIC_RETRY_COUNT + 1):
+                execution_log = None
+                scenario = None
                 request_args, attempt_payload = _prepare_semantic_retry(
                     task.args,
-                    test_payload,
+                    combined_payload,
                     retry_number=retry_number,
                     previous_error=test_error,
                     output_requirement=(
-                        "Return only one complete Python code block containing every "
-                        "required function, with no explanations outside the block."
+                        "Return the complete response from scratch: exactly one JSON "
+                        "scenario block followed by exactly one complete Python test "
+                        "block, with no explanations outside the blocks. The scenario "
+                        "may change from the rejected attempt."
                     ),
                 )
-                raw_test = get_streaming_llm_completion(request_args, attempt_payload)
-                result.test_outputs.append(raw_test)
+                raw_output = get_streaming_llm_completion(request_args, attempt_payload)
+                result.test_outputs.append(raw_output)
                 try:
-                    generated_test = get_generated_test(
-                        raw_test,
-                        context=test_context,
+                    scenario, generated_test = get_generated_scenario_and_test(
+                        raw_output, context=test_context
                     )
+                    generated_test = add_scenario_comment(
+                        generated_test,
+                        scenario,
+                    )
+                    if task.execution_config is not None:
+                        try:
+                            execution_result = evaluate_generated_test(
+                                task.problem,
+                                task.commit,
+                                generated_test,
+                                task.execution_config,
+                            )
+                        except Exception as execution_exception:
+                            raise GeneratedTestError(
+                                f"{test_context}: automated execution raised "
+                                f"{type(execution_exception).__name__}: "
+                                f"{execution_exception}"
+                            ) from execution_exception
+                        execution_log = execution_result.log_path
+                        if not execution_result.passed:
+                            execution_error = execution_result.error or (
+                                "Generated test execution failed without diagnostics"
+                            )
+                            raise GeneratedTestError(
+                                f"{test_context}: automated execution failed:\n"
+                                f"{execution_error}"
+                            )
                 except GeneratedTestError as error:
+                    result.test_attempts.append(
+                        {
+                            "scenario": scenario.model_dump() if scenario else None,
+                            "raw_output": raw_output,
+                            "error": str(error),
+                            "execution_log": execution_log,
+                        }
+                    )
                     if retry_number == SEMANTIC_RETRY_COUNT:
                         error.add_note(
                             f"Failed after the initial request and "
@@ -242,8 +252,19 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                     )
                     test_error = error
                     continue
+                result.test_attempts.append(
+                    {
+                        "scenario": scenario.model_dump(),
+                        "raw_output": raw_output,
+                        "error": None,
+                        "execution_log": execution_log,
+                    }
+                )
                 generated_tests.append(generated_test)
+                successful_scenarios.append(scenario)
                 break
+
+        result.scenarios = [scenario.model_dump() for scenario in successful_scenarios]
 
         if len(generated_tests) != task.args.n:
             raise GeneratedTestError(
@@ -359,6 +380,31 @@ class PerfExpGenerator:
             logger.error(f"Failed to save invalid completions: {save_error}")
             return None
 
+    def save_retry_diagnostics(self, outputs, args) -> Path | None:
+        """Persist recovered validation failures and their execution log paths."""
+        if not outputs:
+            return None
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        path = self.exp_dir / f"{self.exp_id}_generation_retries_{timestamp}.json"
+        try:
+            self.exp_dir.mkdir(parents=True, exist_ok=True)
+            with path.open("w") as file:
+                json.dump(
+                    {
+                        "model_name": args.model_name,
+                        "max_tokens": args.max_tokens,
+                        "tests_per_commit": args.n,
+                        "outputs": outputs,
+                    },
+                    file,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            return path
+        except Exception as save_error:
+            logger.error(f"Failed to save retry diagnostics: {save_error}")
+            return None
+
     def gen(self, args) -> list[Problem]:
         logger.debug(f"Generating perftests: {self.repo}")
 
@@ -403,6 +449,33 @@ class PerfExpGenerator:
         if not commit_tasks:
             raise RuntimeError("No commit generation tasks were prepared")
 
+        repo_path = args.docker_repo_path
+        if repo_path is None:
+            analyzed_repo = ANALYSIS_REPOS_DIR / self.repo.repo_name
+            repo_path = str(analyzed_repo) if analyzed_repo.is_dir() else None
+        execution_config = prepare_generated_test_execution(
+            problems,
+            GeneratedTestExecutionConfig(
+                exp_id=self.exp_id,
+                backend="docker",
+                docker_image=args.docker_image,
+                docker_cpus=args.docker_cpus,
+                docker_memory=args.docker_memory,
+                docker_platform=args.docker_platform,
+                docker_base_image=args.docker_base_image,
+                docker_repo_path=repo_path,
+                rebuild_docker_image=args.rebuild_docker_image,
+                keep_containers=args.keep_containers,
+                keep_workspaces=args.keep_workspaces,
+            ),
+        )
+        commit_tasks = [
+            CommitGenerationTask(
+                **{**task.__dict__, "execution_config": execution_config}
+            )
+            for task in commit_tasks
+        ]
+
         commit_workers = min(args.multiprocess, len(commit_tasks))
         print(
             f"Generating {len(problems)} problems across {len(commit_tasks)} commits "
@@ -420,6 +493,7 @@ class PerfExpGenerator:
 
         generation_errors = []
         failure_diagnostics = []
+        retry_diagnostics = []
         generated_by_commit: dict[tuple[int, int], Tests] = {}
         if len(generation_outputs) != len(commit_tasks):
             generation_errors.append(
@@ -457,6 +531,8 @@ class PerfExpGenerator:
                 generation_errors.append(f"{task_label}: {commit_result.error}")
                 failure_diagnostics.append(commit_result.diagnostic())
                 continue
+            if len(commit_result.test_attempts) > args.n:
+                retry_diagnostics.append(commit_result.diagnostic())
             if commit_result.commit_tests is None:
                 error = "worker returned no commit tests"
                 generation_errors.append(f"{task_label}: {error}")
@@ -519,6 +595,9 @@ class PerfExpGenerator:
         results_path = self.exp_dir / results_json
         save_problems_atomically(results_path, problems)
         print(f"Saved validated generated problems to {results_path}")
+        retry_path = self.save_retry_diagnostics(retry_diagnostics, args)
+        if retry_path is not None:
+            print(f"Saved recovered generation retry diagnostics to {retry_path}")
         return problems
 
 

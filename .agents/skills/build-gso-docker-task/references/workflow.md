@@ -5,7 +5,7 @@
 1. Repository workspace and preflight
 2. Experiment YAML
 3. Commit and API analysis
-4. Test generation
+4. Docker-validated test generation
 5. Docker execution
 6. Evaluation and selection
 7. Dataset build
@@ -83,13 +83,27 @@ Expected artifacts:
 
 Before generation, inspect the analysis checkout's packaging and bootstrap files, such as `pyproject.toml`, `setup.py`, `setup.cfg`, requirements files, lockfiles, and contributor or CI installation instructions. Decide whether the current YAML commands install the repository and all runtime dependencies needed by generated tests. Typical reasons to customize them include required extras, a non-root package directory, native build prerequisites, editable-install limitations, or a repository-specific bootstrap command. If a change is needed, update the YAML first. If the YAML omits `install_commands` and the standard commands are sufficient, leave the field absent.
 
-## 4. Test generation
+Generation now executes every proposed test in Docker, so complete Docker preflight before invoking the LLM:
+
+```bash
+docker image inspect gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
+  2>&1 | tee "$workspace/logs/03-docker-preflight.log"
+test -d ~/buckets/gso_bucket/analysis/repos/REPO_NAME/.git
+```
+
+Confirm every mapped candidate and its parent exist in that checkout. Generation prepares `gso-EXP_ID:latest` once, using commit-only placeholders for image validation, before sending its first generation request.
+
+## 4. Docker-validated test generation
 
 Generate all mapped APIs:
 
 ```bash
 python src/gso/collect/generate/generate.py "$workspace/experiment.yaml" \
-  2>&1 | tee "$workspace/logs/03-generate.log"
+  --docker-base-image gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
+  --docker-repo-path ~/buckets/gso_bucket/analysis/repos/REPO_NAME \
+  --docker-image gso-EXP_ID:latest \
+  --docker-platform linux/amd64 \
+  2>&1 | tee "$workspace/logs/04-generate.log"
 ```
 
 Generate one exact API:
@@ -98,7 +112,11 @@ Generate one exact API:
 python src/gso/collect/generate/generate.py \
   "$workspace/experiment.yaml" \
   --api package.target_api \
-  2>&1 | tee "$workspace/logs/03-generate-package.target_api.log"
+  --docker-base-image gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
+  --docker-repo-path ~/buckets/gso_bucket/analysis/repos/REPO_NAME \
+  --docker-image gso-EXP_ID:latest \
+  --docker-platform linux/amd64 \
+  2>&1 | tee "$workspace/logs/04-generate-package.target_api.log"
 ```
 
 Expected artifact:
@@ -107,7 +125,25 @@ Expected artifact:
 ~/buckets/gso_bucket/experiments/EXP_ID/EXP_ID_problems.json
 ```
 
-The CLI is exposed through Fire. Useful overrides include `--model_name`, `--multiprocess`, `--n`, `--max_tokens`, `--openai_timeout`, `--max_year`, and `--min_loc`. A generation failure is saved as `EXP_ID_generation_failed_<timestamp>.json` and does not overwrite the existing problems file.
+The CLI is exposed through Fire. Useful generation overrides include `--model_name`, `--multiprocess`, `--n`, `--max_tokens`, `--openai_timeout`, `--max_year`, and `--min_loc`. Docker overrides include `--docker-image`, `--docker-base-image`, `--docker-repo-path`, `--docker-cpus`, `--docker-memory`, `--docker-platform`, `--rebuild-docker-image`, `--keep-containers`, and `--keep-workspaces`.
+
+Generation behavior is sequential within each commit and parallel across commits:
+
+1. Request exactly one response containing one JSON scenario block followed by one Python test block.
+2. Parse and statically validate both, add the scenario to the test as comments, then execute the test against the candidate's parent and candidate in Docker.
+3. Accept the scenario only when setup, reference execution, candidate execution, and equivalence checking produce usable results.
+4. On format, static, or execution failure, feed the diagnostic back to the LLM and regenerate the complete pair from scratch, for up to three semantic retries.
+5. Include only previously accepted scenarios in the next request so the `n` tests differ materially.
+
+`--multiprocess` controls concurrent commit workers, while each worker validates its `n` tests one at a time. Account for LLM and Docker load when choosing it. Generation-time validation is a correctness gate, not a stable benchmark run.
+
+A fully recovered retry is saved as `EXP_ID_generation_retries_<timestamp>.json`, including raw attempts, errors, scenarios, and available execution-log paths. A terminal generation failure is saved as `EXP_ID_generation_failed_<timestamp>.json`; the problems file is all-or-nothing and an existing file is not overwritten. Validation artifacts are written below:
+
+```text
+~/buckets/gso_bucket/experiments/EXP_ID/generation_validation/
+~/buckets/gso_bucket/experiments/EXP_ID/docker_logs/generation_validation/
+~/buckets/gso_bucket/experiments/EXP_ID/docker_logs/generation_validation/repository_image/build.log
+```
 
 Generated problems contain YAML `install_commands` when configured. If the field is absent, they contain the standard `Problem` commands. Verify the saved problems artifact contains the expected commands before execution.
 
@@ -117,7 +153,7 @@ Prefer the exact local analysis checkout:
 
 ```bash
 docker image inspect gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
-  2>&1 | tee "$workspace/logs/04-docker-preflight.log"
+  2>&1 | tee "$workspace/logs/05-docker-preflight.log"
 test -d ~/buckets/gso_bucket/analysis/repos/REPO_NAME/.git
 
 python src/gso/collect/execute/execute.py \
@@ -128,14 +164,14 @@ python src/gso/collect/execute/execute.py \
   --docker-image gso-EXP_ID:latest \
   --docker-platform linux/amd64 \
   --machines 1 \
-  2>&1 | tee "$workspace/logs/05-execute.log"
+  2>&1 | tee "$workspace/logs/06-execute.log"
 ```
 
 Add `--api package.target_api` to run one API. Add `--rebuild-docker-image` to append Docker's `--no-cache`. Optional controls include `--docker-cpus`, `--docker-memory`, `--runs`, `--keep-containers`, `--keep-workspaces`, and `--poll-interval`.
 
 When `--docker-base-image` is supplied, execution builds the repository image. With `--docker-repo-path`, it copies the entire local checkout, including `.git`, into `/workspace/REPO_NAME`. Without `--docker-repo-path`, the repository image clones `repo_url` remotely. Omitting `--docker-base-image` requires `--docker-image` to exist already.
 
-The runtime verifies required tools, the repo checkout, every candidate commit, and every candidate's parent before launching phase scripts.
+The runtime verifies required tools, the repo checkout, every candidate commit, and every candidate's parent before launching phase scripts. Run this formal execution even though generation already validated each test: it creates the Docker results used for evaluation and selection, and can repeat measurements under controlled conditions.
 
 Expected artifacts:
 
@@ -153,7 +189,7 @@ python src/gso/collect/execute/evaluate.py \
   --exp_id EXP_ID \
   --speedup_mode commit \
   --output-dir "$workspace/plots" \
-  2>&1 | tee "$workspace/logs/06-evaluate.log"
+  2>&1 | tee "$workspace/logs/07-evaluate.log"
 ```
 
 Add `--api package.target_api` to narrow evaluation. Docker defaults to `commit` mode when `--speedup_mode` is omitted, but specify it for an auditable command.
@@ -183,7 +219,7 @@ python src/gso/collect/build_dataset.py \
   --pids-file "$workspace/custom_pids.py" \
   --dataset_name gso_EXP_ID \
   --debug \
-  2>&1 | tee "$workspace/logs/07-build-dataset.log"
+  2>&1 | tee "$workspace/logs/08-build-dataset.log"
 ```
 
 Expected artifact:

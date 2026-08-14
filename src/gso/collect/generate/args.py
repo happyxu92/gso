@@ -4,6 +4,7 @@ from pydantic import Field
 
 DEFAULT_GENERATION_MAX_TOKENS = 32768
 DEFAULT_GENERATION_OPENAI_TIMEOUT = 600
+DEFAULT_GENERATION_DOCKER_BASE_IMAGE = "gso-base:ubuntu22.04-py312-uv0.5.4-amd64"
 
 
 class PerfExpGenArgs(LLMArgs):
@@ -19,8 +20,8 @@ class PerfExpGenArgs(LLMArgs):
         5,
         ge=1,
         description=(
-            "Number of scenarios/tests generated per commit; each LLM request "
-            "returns one choice."
+            "Number of scenarios/tests generated per commit. Each scenario is "
+            "planned, generated, and executed before the next one is requested."
         ),
     )
     max_tokens: int = Field(
@@ -34,6 +35,32 @@ class PerfExpGenArgs(LLMArgs):
         description="Timeout in seconds for each OpenAI-compatible API request.",
     )
     api: str | None = Field(None, description="API to generate tests for.")
+    docker_image: str | None = Field(
+        None,
+        description="Docker repository image (default: gso-<exp_id>:latest).",
+    )
+    docker_base_image: str | None = Field(
+        DEFAULT_GENERATION_DOCKER_BASE_IMAGE,
+        description="Base image used to build the Docker repository image.",
+    )
+    docker_repo_path: str | None = Field(
+        None,
+        description="Local repository checkout copied into the Docker image.",
+    )
+    docker_cpus: float | None = Field(None, gt=0, description="Docker CPU limit.")
+    docker_memory: str | None = Field(None, description="Docker memory limit.")
+    docker_platform: str | None = Field(
+        None, description="Docker platform, for example linux/amd64."
+    )
+    rebuild_docker_image: bool = Field(
+        False, description="Build the repository image without Docker layer cache."
+    )
+    keep_containers: bool = Field(
+        False, description="Keep test-validation containers after execution."
+    )
+    keep_workspaces: bool = Field(
+        False, description="Keep generated test-validation workspaces."
+    )
 
     @classmethod
     def parse(cls, *args, **kwargs):

@@ -84,6 +84,8 @@ def main() -> None:
     problems_path = exp_dir / f"{exp_id}_problems.json"
     results_path = exp_dir / f"{exp_id}_results_docker.json"
     docker_logs_path = exp_dir / "docker_logs"
+    generation_results_path = exp_dir / "generation_validation"
+    generation_logs_path = docker_logs_path / "generation_validation"
     dataset_name = f"gso_{exp_id}"
     dataset_path = bucket / "datasets" / f"{dataset_name}_dataset.jsonl"
     repo_image = f"gso-{exp_id}:latest"
@@ -102,6 +104,8 @@ def main() -> None:
         "commits_path": str(commits_path),
         "apis_path": str(apis_path),
         "problems_path": str(problems_path),
+        "generation_results_path": str(generation_results_path),
+        "generation_logs_path": str(generation_logs_path),
         "docker_results_path": str(results_path),
         "docker_logs_path": str(docker_logs_path),
         "run_logs_path": str(run_logs_path),
@@ -116,6 +120,16 @@ def main() -> None:
     ]
     if args.api:
         generate_lines.append(["--api", args.api])
+    generate_lines.extend(
+        [
+            ["--docker-base-image", args.base_image],
+            ["--docker-repo-path", repo_path],
+            ["--docker-image", repo_image],
+            ["--docker-platform", args.docker_platform],
+        ]
+    )
+    if args.rebuild_docker_image:
+        generate_lines.append(["--rebuild-docker-image"])
 
     execute_lines: list[list[str | Path]] = [
         ["python", "src/gso/collect/execute/execute.py"],
@@ -172,29 +186,29 @@ def main() -> None:
     )
     print(
         logged_command(
-            continued_command(generate_lines), run_logs_path / "03-generate.log"
-        )
-    )
-    print(
-        logged_command(
             command("docker", "image", "inspect", args.base_image),
-            run_logs_path / "04-docker-preflight.log",
+            run_logs_path / "03-docker-preflight.log",
         )
     )
     print(
         logged_command(
-            continued_command(execute_lines), run_logs_path / "05-execute.log"
+            continued_command(generate_lines), run_logs_path / "04-generate.log"
         )
     )
     print(
         logged_command(
-            continued_command(evaluate_lines), run_logs_path / "06-evaluate.log"
+            continued_command(execute_lines), run_logs_path / "06-execute.log"
+        )
+    )
+    print(
+        logged_command(
+            continued_command(evaluate_lines), run_logs_path / "07-evaluate.log"
         )
     )
     print(
         logged_command(
             continued_command(dataset_lines),
-            run_logs_path / "07-build-dataset.log",
+            run_logs_path / "08-build-dataset.log",
         )
     )
 
