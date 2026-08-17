@@ -99,6 +99,8 @@ class PerfAnalysis(BaseModel):
     repo_owner: str
     repo_name: str
     performance_commits: list[PerformanceCommit]
+    analyzed_commit_hashes: list[str] = Field(default_factory=list)
+    analyzed_before: datetime | None = None
 
 
 class APICommitMap(BaseModel):

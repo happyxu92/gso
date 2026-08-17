@@ -4,7 +4,7 @@ import os
 import re
 import json
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from multiprocessing import Pool
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -367,6 +367,8 @@ class PerfCommitAnalyzer:
         no_grep: bool,
         max_year: int | None,
         max_commits: int | None = None,
+        analyzed_commit_hashes: set[str] | None = None,
+        analyzed_before: datetime | None = None,
     ) -> list[PerformanceCommit]:
 
         base_cmd = ["git", "log", "--pretty=format:%H", "-i"]
@@ -387,11 +389,22 @@ class PerfCommitAnalyzer:
             print("Using grep to filter commits")
             base_cmd = base_cmd[:3] + grep_filters + ["-i"]
 
-        if max_commits is not None:
-            base_cmd.append(f"--max-count={max_commits}")
+        if analyzed_before is not None:
+            base_cmd.append(f"--since={analyzed_before.isoformat()}")
 
-        # get commit hashes
+        # get commit hashes, excluding commits covered by a previous analysis
         commit_hashes = run_git_command(base_cmd, cwd=repo_path).splitlines()
+        if analyzed_commit_hashes is not None:
+            commit_hashes = [
+                commit_hash
+                for commit_hash in commit_hashes
+                if commit_hash not in analyzed_commit_hashes
+            ]
+            print("# New Candidate Commits:", len(commit_hashes))
+
+        # Apply the limit after excluding previous results so it limits new work.
+        if max_commits is not None:
+            commit_hashes = commit_hashes[:max_commits]
 
         # Parse and process commits
         commits = []
@@ -411,10 +424,18 @@ class PerfCommitAnalyzer:
 
         commits = [commit for commit in commits if commit is not None]
         print("# Candidate Commits:", len(commits))
+        if not commits:
+            print("No new commits to analyze")
+            return []
 
         # ask user if they want to proceed with LLM analysis on XX commits
         if not prompt_yes_no("Proceed with LLM analysis on these commits?"):
             return []
+
+        # Record every commit sent for analysis, including commits rejected by the LLM.
+        # This prevents rejected candidates from being analyzed again on the next run.
+        if analyzed_commit_hashes is not None:
+            analyzed_commit_hashes.update(commit.commit_hash for commit in commits)
 
         # LLM Analysis
         filtered, retriever = PerfCommitAnalyzer.llm_analysis(commits, repo_path)
@@ -432,17 +453,57 @@ class PerfCommitAnalyzer:
         repo_url = args.repo_url
         repo_owner, repo_name = repo_url.split("/")[-2:]
         repo_path = ANALYSIS_REPOS_DIR / repo_name
+        output_file = ANALYSIS_COMMITS_DIR / f"{repo_name}_commits.json"
         ANALYSIS_REPOS_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Clone the repository if not alread in ANALYSIS_DIR / "repos"
+        # Clone the repository if not already in ANALYSIS_DIR / "repos"
         if not os.path.exists(repo_path):
             subprocess.run(["git", "clone", repo_url, repo_path])
 
-        performance_commits = PerfCommitAnalyzer.get_performance_commits(
+        existing_analysis = None
+        analyzed_commit_hashes: set[str] = set()
+        analyzed_before = None
+        if output_file.exists():
+            existing_analysis = PerfCommitAnalyzer.load_analysis(output_file)
+            analyzed_commit_hashes.update(existing_analysis.analyzed_commit_hashes)
+            analyzed_before = existing_analysis.analyzed_before
+            if (
+                analyzed_before is None
+                and "analyzed_commit_hashes" not in existing_analysis.model_fields_set
+            ):
+                # Legacy files only stored accepted performance commits. Treat commits
+                # dated before the artifact was written as part of that prior run.
+                analyzed_before = datetime.fromtimestamp(
+                    output_file.stat().st_mtime, tz=timezone.utc
+                )
+            # Backward compatibility for analysis files created before
+            # analyzed_commit_hashes was recorded.
+            analyzed_commit_hashes.update(
+                commit.commit_hash for commit in existing_analysis.performance_commits
+            )
+            print(
+                f"Reusing {len(existing_analysis.performance_commits)} existing "
+                f"performance commits from {output_file}"
+            )
+
+        new_performance_commits = PerfCommitAnalyzer.get_performance_commits(
             repo_path,
             args.no_grep,
             args.max_year,
             getattr(args, "max_commits", None),
+            analyzed_commit_hashes,
+            analyzed_before,
+        )
+
+        existing_commits = (
+            existing_analysis.performance_commits if existing_analysis else []
+        )
+        commits_by_hash = {
+            commit.commit_hash: commit
+            for commit in [*existing_commits, *new_performance_commits]
+        }
+        performance_commits = sorted(
+            commits_by_hash.values(), key=lambda commit: commit.date, reverse=True
         )
 
         return PerfAnalysis(
@@ -450,6 +511,8 @@ class PerfCommitAnalyzer:
             repo_owner=repo_owner,
             repo_name=repo_name,
             performance_commits=performance_commits,
+            analyzed_commit_hashes=sorted(analyzed_commit_hashes),
+            analyzed_before=analyzed_before,
         )
 
     @staticmethod
