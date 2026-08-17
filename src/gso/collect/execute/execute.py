@@ -532,7 +532,7 @@ async def _async_evaluate_generated_test(
         for result in run_results
     ]
     passed = any(
-        result.get("commit") == commit.commit_hash
+        result.get("commit") in {commit.commit_hash, commit.quick_hash()}
         and "base_result" in result
         and "commit_result" in result
         and result.get("base_result") is not None
