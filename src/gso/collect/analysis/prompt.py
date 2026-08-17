@@ -10,9 +10,21 @@ You will be given a GitHub commit patch content. Your goal is to identify whethe
 7. The commit should affect performance on CPU and should be testable without a GPU. Ignore commits related to GPU/TPU workloads only.
 8. Ignore commits that only work on specific hardware (e.g., Qualcomm GPUs, Metal, Vulkan, etc.). Keep generalization and testability in mind.
 
-Analyze the commit using natural language reasoning enclosed in [REASON] [/REASON] tags.
-Then write YES or NO based on the conditions mentioned above enclosed in [ANSWER] [/ANSWER] tags.
-Remember to close all tags properly.
+Respond with ONLY a single JSON object and nothing else. Do not wrap it in Markdown code fences. Do not write any text before or after the JSON.
+
+Use exactly this schema:
+{{
+  "reason": "<your natural-language reasoning about whether this commit is performance related, referencing the conditions above>",
+  "answer": "yes" or "no"
+}}
+
+Rules:
+- "answer" must be exactly "yes" or "no" in lowercase.
+- "reason" must be a non-empty string. Escape any double quotes as \" and newlines as \n so the JSON stays valid.
+- If you cannot decide, lean towards "no".
+
+Example output:
+{{"reason": "The commit rewrites the inner comparison loop to avoid redundant work, reducing CPU runtime of a top-level sort API.", "answer": "yes"}}
 
 Commit Information:
 {diff_text}
@@ -38,9 +50,22 @@ You will be given a performance or optimization related GitHub commit patch cont
 6. Finally, if all else, and the commit does not affect any APIs, write "None".
 """
 
-PERF_IDENTIFY_API_TASK = """Analyze the commit using natural language reasoning enclosed in [REASON] [/REASON] tags.
-Then list the affected APIs (max 5 comma separated) enclosed in [APIS] [/APIS] tags.
-Remember to close all tags properly.
+PERF_IDENTIFY_API_TASK = """Respond with ONLY a single JSON object and nothing else. Do not wrap it in Markdown code fences. Do not write any text before or after the JSON.
+
+Use exactly this schema:
+{{
+  "reason": "<your natural-language reasoning about which APIs are affected by this commit>",
+  "apis": ["<api1>", "<api2>"]
+}}
+
+Rules:
+- "apis" must be a JSON array of strings. List at most 5 affected high-level Python APIs (e.g., "pd.read_csv", "DataFrame.dropna").
+- Use "ClassName.method_name" for methods. Find PYTHON APIs only: if only backend (C/C++/Rust) code changes, list the Python APIs that call them.
+- If no APIs are affected, return an empty array [].
+- Keep the JSON valid: escape double quotes as \" and newlines as \n inside string values.
+
+Example output:
+{{"reason": "The commit optimizes the CSV parser's type inference, exercised by pd.read_csv.", "apis": ["pd.read_csv"]}}
 
 Commit Information:
 {diff_text}

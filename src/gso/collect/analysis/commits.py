@@ -198,7 +198,76 @@ class PerfCommitAnalyzer:
         return section
 
     @staticmethod
+    def parse_json_dict(response: str):
+        """Best-effort extraction of a JSON object from an LLM response.
+
+        Tolerates Markdown code fences and stray text around the object.
+        Returns the parsed dict, or None if no valid JSON object is found.
+        """
+        if not isinstance(response, str) or not response.strip():
+            return None
+        text = response.strip()
+
+        # Strip a ```json ...``` fenced block if present (common with GLM).
+        fence = re.search(
+            r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE
+        )
+        if fence:
+            text = fence.group(1).strip()
+
+        # Fast path: the whole trimmed text is the object.
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+        # Fallback: scan for a brace-balanced object, skipping string contents.
+        for start in range(len(text)):
+            if text[start] != "{":
+                continue
+            depth = 0
+            in_str = False
+            escaped = False
+            for end in range(start, len(text)):
+                ch = text[end]
+                if in_str:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_str = False
+                elif ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start : end + 1]
+                        try:
+                            obj = json.loads(candidate)
+                            if isinstance(obj, dict):
+                                return obj
+                        except Exception:
+                            break  # mismatched; try the next opening brace
+                        break
+        return None
+
+    @staticmethod
     def parse_analysis_response(response: str) -> tuple[str, str]:
+        # Prefer the structured JSON format. Fall back to the legacy
+        # [REASON]/[ANSWER] tag format so old cached completions still parse.
+        obj = PerfCommitAnalyzer.parse_json_dict(response)
+        if obj is not None:
+            reasoning = str(obj.get("reason", obj.get("reasoning", ""))).strip()
+            answer_text = str(obj.get("answer", "")).strip().lower()
+            answer_match = re.search(r"\b(yes|no)\b", answer_text)
+            if reasoning and answer_match is not None:
+                return reasoning, answer_match.group(1)
+
         reasoning = PerfCommitAnalyzer.extract_tagged_section(response, "REASON")
         answer_text = PerfCommitAnalyzer.extract_tagged_section(response, "ANSWER")
         answer_match = re.match(r"(YES|NO)\b", answer_text, re.IGNORECASE)
@@ -345,13 +414,27 @@ class PerfCommitAnalyzer:
             try:
                 if not completions or not isinstance(completions[0], str):
                     raise ValueError("LLM returned no completion")
-                reasoning = PerfCommitAnalyzer.extract_tagged_section(
-                    completions[0], "REASON"
-                )
-                api_text = PerfCommitAnalyzer.extract_tagged_section(
-                    completions[0], "APIS"
-                )
-                apis = [api.strip() for api in api_text.split(",") if api.strip()]
+                reasoning = ""
+                apis: list[str] = []
+                obj = PerfCommitAnalyzer.parse_json_dict(completions[0])
+                if obj is not None:
+                    reasoning = str(
+                        obj.get("reason", obj.get("reasoning", ""))
+                    ).strip()
+                    apis_raw = obj.get("apis", [])
+                    if isinstance(apis_raw, str):
+                        apis = [a.strip() for a in apis_raw.split(",") if a.strip()]
+                    elif isinstance(apis_raw, list):
+                        apis = [str(a).strip() for a in apis_raw if str(a).strip()]
+                if not reasoning:
+                    # Fall back to the legacy [REASON]/[APIS] tag format.
+                    reasoning = PerfCommitAnalyzer.extract_tagged_section(
+                        completions[0], "REASON"
+                    )
+                    api_text = PerfCommitAnalyzer.extract_tagged_section(
+                        completions[0], "APIS"
+                    )
+                    apis = [api.strip() for api in api_text.split(",") if api.strip()]
             except ValueError as exc:
                 print(f"No APIs recorded for {commit.commit_hash}: {exc}")
                 apis = []
