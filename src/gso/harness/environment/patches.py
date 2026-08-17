@@ -19,6 +19,18 @@ def url_to_filename(url):
     hash_digest = hashlib.sha256(url.encode()).hexdigest()
     return os.path.join(CACHE_DIR, hash_digest)
 
+def _make_cached_response(url, content, headers=None):
+    response = requests.Response()
+    response.status_code = 200
+    response.url = str(url)
+    response._content = content
+    # Cached content is already fully buffered. Mark it consumed so requests
+    # serves iter_content() from _content instead of reading the absent raw stream.
+    response._content_consumed = True
+    if headers:
+        response.headers.update(headers)
+    return response
+
 # Wikimedia thumbnail-size compatibility shim.
 # Wikimedia has tightened accepted thumbnail sizes, so URLs like
 #   /thumb/{path}/{file}/{N}px-{file}
@@ -73,12 +85,11 @@ def patched_get(url, *args, **kwargs):
     if os.path.exists(cache_path):
         with open(cache_path, 'rb') as f:
             cached_content = f.read()
-        response = requests.Response()
-        response.status_code = 200
-        response.url = url
-        response._content = cached_content
-        response.headers['X-From-Cache'] = 'true'
-        return response
+        return _make_cached_response(
+            url,
+            cached_content,
+            {'X-From-Cache': 'true'},
+        )
 
     if os.getenv("DEBUG_GSO") == "true":
         print(f"WARN: cache miss for url: {url} in file: {__file__}")
@@ -99,12 +110,11 @@ def patched_get(url, *args, **kwargs):
         if fallback_bytes is not None:
             with open(cache_path, 'wb') as f:
                 f.write(fallback_bytes)
-            fake = requests.Response()
-            fake.status_code = 200
-            fake.url = url
-            fake._content = fallback_bytes
-            fake.headers['X-Wiki-Thumb-Rewrite'] = 'true'
-            return fake
+            return _make_cached_response(
+                url,
+                fallback_bytes,
+                {'X-Wiki-Thumb-Rewrite': 'true'},
+            )
 
     if response.status_code == 200:
         with open(cache_path, 'wb') as f:
@@ -126,12 +136,14 @@ def _cached_session_request(self, method, url, **kwargs):
         if os.path.exists(cache_path):
             with open(cache_path, 'rb') as f:
                 cached_content = f.read()
-            response = requests.Response()
-            response.status_code = 200
-            response.url = str(url)
-            response._content = cached_content
-            response.headers['X-From-Cache'] = 'true'
-            response.headers['Content-Type'] = 'application/json'
+            response = _make_cached_response(
+                url,
+                cached_content,
+                {
+                    'X-From-Cache': 'true',
+                    'Content-Type': 'application/json',
+                },
+            )
             if os.getenv("DEBUG_GSO") == "true":
                 print(f"HF cache HIT: {url}")
             return response
