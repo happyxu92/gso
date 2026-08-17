@@ -125,7 +125,7 @@ SCENARIO_TEST_MSG = """Design exactly one new performance-test scenario for the 
 Requirements:
 1. The scenario and test must exercise the target API and be relevant to the supplied optimization commit.
 2. The scenario must describe the exact realistic, non-trivial workload implemented by the test, with setup kept outside the timed experiment.
-3. The new scenario must differ materially from every successful scenario listed below in input structure, data distribution, scale, API usage path, or optimized behavior. Do not vary only arbitrary parameter values.
+3. The new scenario must differ materially from every scenario listed below (both successful and failed) in input structure, data distribution, scale, API usage path, or optimized behavior. Do not vary only arbitrary parameter values. In particular, do not reuse a failed scenario whose test was rejected.
 4. Use reproducible inputs and avoid uniform, sorted, repeating, or easily hackable patterns.
 5. Keep the scenario and implementation consistent; do not describe one workload and implement another.
 6. Describe how the result can be stored and compared with a reference result.
@@ -152,7 +152,7 @@ Second, return one `python` block containing the complete test implementation wi
 
 This is test {scenario_number} of {scenario_count}.
 
-Previously generated and successfully executed scenarios:
+Previously generated scenarios (full plans for successful ones; title plus rejection reason for failed ones):
 {previous_scenarios}
 """
 

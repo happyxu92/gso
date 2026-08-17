@@ -82,15 +82,56 @@ class CommitGenerationResult:
         }
 
 
-def format_previous_scenarios(scenarios: list[TestScenario]) -> str:
-    """Format only successfully executed scenarios for the next LLM request."""
-    if not scenarios:
+FAILED_SCENARIO_ERROR_MAX_CHARS = 800
+
+
+def _summarize_failed_scenario(
+    scenario: TestScenario | None, error: GeneratedTestError
+) -> dict:
+    """Compact ``{title, error}`` record for a failed scenario slot.
+
+    Full per-attempt diagnostics (raw output, execution log, full error) are kept in
+    ``CommitGenerationResult``; this summary only steers the next scenario away from
+    repeating a workload whose test was already rejected.
+    """
+    title = scenario.title if scenario is not None else "<unparsed scenario>"
+    message = str(error)
+    if len(message) > FAILED_SCENARIO_ERROR_MAX_CHARS:
+        message = message[:FAILED_SCENARIO_ERROR_MAX_CHARS] + " ...(truncated)"
+    return {"title": title, "error": message}
+
+
+def format_previous_scenarios(
+    scenarios: list[TestScenario],
+    failed_scenarios: list[dict] | None = None,
+) -> str:
+    """Format successful and failed scenarios for the next LLM request.
+
+    Successful scenarios are listed in full so the model can produce materially
+    different workloads. Failed scenarios are listed as ``{title, error}`` only, so
+    the model avoids reusing a scenario whose test was already rejected.
+    """
+    has_successful = bool(scenarios)
+    has_failed = bool(failed_scenarios)
+    if not has_successful and not has_failed:
         return "None. This is the first scenario."
-    return json.dumps(
-        [scenario.model_dump() for scenario in scenarios],
-        indent=2,
-        ensure_ascii=False,
-    )
+
+    sections: list[str] = []
+    if has_successful:
+        sections.append(
+            "Successful scenarios:\n"
+            + json.dumps(
+                [scenario.model_dump() for scenario in scenarios],
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    if has_failed:
+        sections.append(
+            "Failed scenarios (do not reuse these; the rejection reason is shown):\n"
+            + json.dumps(failed_scenarios, indent=2, ensure_ascii=False)
+        )
+    return "\n\n".join(sections)
 
 
 def add_scenario_comment(test: str, scenario: TestScenario) -> str:
@@ -158,13 +199,16 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
         commit_tests = prepare_mp_helper((task.repo, task.problem, task.commit, False))
         generated_tests = []
         successful_scenarios: list[TestScenario] = []
+        failed_scenarios: list[dict] = []
         for scenario_index in range(1, task.args.n + 1):
             combined_task = SCENARIO_TEST_MSG.format(
                 api=task.problem.api,
                 repo_name=task.repo.repo_name,
                 scenario_number=scenario_index,
                 scenario_count=task.args.n,
-                previous_scenarios=format_previous_scenarios(successful_scenarios),
+                previous_scenarios=format_previous_scenarios(
+                    successful_scenarios, failed_scenarios
+                ),
             )
             if task.repo.repo_instr:
                 combined_task += (
@@ -257,6 +301,9 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                                 "error": str(error),
                                 "execution_log": execution_log,
                             }
+                        )
+                        failed_scenarios.append(
+                            _summarize_failed_scenario(scenario, error)
                         )
                         logger.error(
                             "%s failed after the initial request and %d semantic "
