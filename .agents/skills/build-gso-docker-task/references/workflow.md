@@ -83,6 +83,45 @@ Expected artifacts:
 
 Before generation, inspect the analysis checkout's packaging and bootstrap files, such as `pyproject.toml`, `setup.py`, `setup.cfg`, requirements files, lockfiles, and contributor or CI installation instructions. Decide whether the current YAML commands install the repository and all runtime dependencies needed by generated tests. Typical reasons to customize them include required extras, a non-root package directory, native build prerequisites, editable-install limitations, or a repository-specific bootstrap command. If a change is needed, update the YAML first. If the YAML omits `install_commands` and the standard commands are sufficient, leave the field absent.
 
+### install_commands working-directory contract
+
+The phase1 and phase2 scripts (`src/gso/collect/execute/phase1.txt`, `phase2.txt`) wrap every commit checkout in this sequence:
+
+```bash
+cd $repo_name && git stash -u   # /workspace -> /workspace/REPO_NAME
+git checkout <commit>
+$install_commands               # runs in /workspace/REPO_NAME
+cd ..                           # must return to /workspace
+for test_file in "<hash>"/test_*.py; do ...   # glob needs /workspace as cwd
+```
+
+`$install_commands` is interpolated verbatim (`"\n        ".join(...)` in `src/gso/collect/execute/skymgr.py`), so it runs as bare bash in the same shell. The contract: **after the install commands finish, the shell cwd must still be `/workspace/REPO_NAME`** so the following `cd ..` lands on `/workspace` and the `<hash>/test_*.py` glob matches `/workspace/<hash>/test_0.py`.
+
+Breaking the contract produces a signature failure: the glob matches nothing, bash hands the literal pattern to `python`, and the container log shows `python: can't open file '//<hash>/test_*.py'` (the leading `//` means cwd was `/`). phase1 then emits no `working_pairs.json`, generation reports `collected 0 result(s)` for that slot, and the worker spends up to three semantic retries before skipping it — even though every test file was correctly written under `/workspace/<hash>/`.
+
+Fixes and anti-patterns:
+
+- **Installing from a subdirectory** (monorepo `packages/` layout, non-root `pyproject.toml`): isolate the `cd` in a subshell so the parent cwd is unchanged.
+  ```bash
+  # WRONG — leaks cwd into packages/markitdown
+  cd packages/markitdown && uv pip install -e '.[all]'
+  # RIGHT — subshell restores cwd
+  ( cd packages/markitdown && uv pip install -e '.[all]' ) || uv pip install -e .
+  ```
+- **A stale trailing `cd /testbed` (or any absolute `cd`)** copied from another harness: remove it. The standard `Problem` install commands contain no `cd` at all.
+- **A conditional `cd` on a file-layout check** (`if [ -f packages/.../pyproject.toml ]; then cd ...`): put each branch's `cd` inside a subshell, or reset cwd at the end of every branch. A `cd` on only the matched branch still breaks the next `cd ..`.
+
+Verify locally before regenerating:
+
+```bash
+cd ~/buckets/gso_bucket/analysis/repos/REPO_NAME
+# run the exact joined install_commands verbatim, then:
+pwd
+# must print the checkout root (.../REPO_NAME), never a subdirectory and never /
+```
+
+Because install commands are baked into `*_problems.json` and the repository image install step, changing them requires a regenerate with `--rebuild-docker-image` followed by a re-run of formal execution; leftover problem/result files still carry the broken commands. After editing the YAML, grep the saved `*_problems.json` to confirm the new commands propagated before execution.
+
 Generation now executes every proposed test in Docker, so complete Docker preflight before invoking the LLM:
 
 ```bash
