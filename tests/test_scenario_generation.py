@@ -7,7 +7,9 @@ from r2e.llms.llm_args import LLMArgs
 
 from gso.collect.generate.args import PerfExpGenArgs
 from gso.collect.generate.generate import (
+    CommitGenerationResult,
     CommitGenerationTask,
+    PerfExpGenerator,
     SEMANTIC_RETRY_COUNT,
     create_generation_problem,
     generate_commit_tests,
@@ -505,7 +507,7 @@ def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch):
     assert "candidate output differs from reference" in retry_instruction
 
 
-def test_commit_worker_stops_after_three_execution_retries(monkeypatch):
+def test_commit_worker_skips_failed_test_slot_and_continues(monkeypatch):
     repo = Repo(
         repo_url="https://github.com/example/repo",
         repo_owner="example",
@@ -518,7 +520,7 @@ def test_commit_worker_stops_after_three_execution_retries(monkeypatch):
         date="2024-01-01T00:00:00",
     )
     problem = Problem(pid="repo.target", repo=repo, api="target", commits=[commit])
-    args = PerfExpGenArgs(yaml_path="unused.yaml", model_name="custom-model", n=1)
+    args = PerfExpGenArgs(yaml_path="unused.yaml", model_name="custom-model", n=2)
 
     def fake_prepare(task_args):
         _, _, prepared_commit, _ = task_args
@@ -529,6 +531,7 @@ def test_commit_worker_stops_after_three_execution_retries(monkeypatch):
     responses = iter(
         [
             *([combined_output()] * (SEMANTIC_RETRY_COUNT + 1)),
+            combined_output({**SCENARIO_TEMPLATE, "title": "second"}),
         ]
     )
     execution_count = 0
@@ -536,7 +539,9 @@ def test_commit_worker_stops_after_three_execution_retries(monkeypatch):
     def fake_evaluate(*args):
         nonlocal execution_count
         execution_count += 1
-        return GeneratedTestExecutionResult(passed=False, error="always fails")
+        if execution_count <= SEMANTIC_RETRY_COUNT + 1:
+            return GeneratedTestExecutionResult(passed=False, error="always fails")
+        return GeneratedTestExecutionResult(passed=True)
 
     monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
     monkeypatch.setattr(
@@ -559,6 +564,109 @@ def test_commit_worker_stops_after_three_execution_retries(monkeypatch):
         )
     )
 
-    assert execution_count == SEMANTIC_RETRY_COUNT + 1
-    assert len(result.test_attempts) == SEMANTIC_RETRY_COUNT + 1
-    assert "always fails" in result.error
+    assert result.error is None
+    assert result.commit_tests is not None
+    assert result.commit_tests.num_samples() == 1
+    assert execution_count == SEMANTIC_RETRY_COUNT + 2
+    assert len(result.test_attempts) == SEMANTIC_RETRY_COUNT + 2
+    assert result.failed_test_slots == [
+        {
+            "scenario_index": 1,
+            "error": (
+                "repo.target/abcdef1 scenario/test 1: automated execution failed:\n"
+                "always fails"
+            ),
+            "execution_log": None,
+        }
+    ]
+    assert result.test_attempts[-1]["scenario_index"] == 2
+    assert result.test_attempts[-1]["error"] is None
+    assert "# title: second" in result.commit_tests.samples[0]
+
+
+def test_generator_skips_failed_commit_and_saves_successful_commit(
+    monkeypatch, tmp_path
+):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    failed_commit = PerformanceCommit(
+        commit_hash="1111111234567890",
+        subject="Broken generation",
+        message="Broken generation",
+        date="2024-01-01T00:00:00",
+    )
+    successful_commit = PerformanceCommit(
+        commit_hash="2222222234567890",
+        subject="Successful generation",
+        message="Successful generation",
+        date="2024-01-02T00:00:00",
+    )
+    generator = object.__new__(PerfExpGenerator)
+    generator.config = {"py_version": "3.12"}
+    generator.repo = repo
+    generator.candidates = {"target": [failed_commit, successful_commit]}
+    generator.exp_id = "repo"
+    generator.exp_dir = tmp_path
+    args = PerfExpGenArgs(yaml_path="unused.yaml", n=1, multiprocess=1)
+
+    successful_tests = CommitTests.from_commit(successful_commit)
+    successful_tests.add_sample(VALID_TEST)
+    outputs = [
+        SimpleNamespace(
+            is_success=lambda: True,
+            result=CommitGenerationResult(
+                problem_index=0,
+                commit_index=0,
+                pid="repo-target",
+                commit_hash=failed_commit.commit_hash,
+                error="commit setup failed",
+            ),
+        ),
+        SimpleNamespace(
+            is_success=lambda: True,
+            result=CommitGenerationResult(
+                problem_index=0,
+                commit_index=1,
+                pid="repo-target",
+                commit_hash=successful_commit.commit_hash,
+                commit_tests=successful_tests,
+            ),
+        ),
+    ]
+    saved = {}
+
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.prepare_generated_test_execution",
+        lambda problems, config: None,
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.run_tasks_in_parallel",
+        lambda *args, **kwargs: outputs,
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.validate_problem_test_samples",
+        lambda problems: None,
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.save_problems_atomically",
+        lambda path, problems: saved.update(path=path, problems=problems),
+    )
+    monkeypatch.setattr(
+        generator,
+        "save_retry_diagnostics",
+        lambda diagnostics, args: saved.update(diagnostics=diagnostics),
+    )
+
+    problems = generator.gen(args)
+
+    assert problems == saved["problems"]
+    assert len(problems) == 1
+    assert problems[0].commits == [successful_commit]
+    assert problems[0].tests == [successful_tests]
+    assert saved["path"] == tmp_path / "repo_problems.json"
+    assert len(saved["diagnostics"]) == 1
+    assert saved["diagnostics"][0]["commit_hash"] == failed_commit.commit_hash
+    assert saved["diagnostics"][0]["error"] == "commit setup failed"

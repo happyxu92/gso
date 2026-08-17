@@ -2,10 +2,11 @@
 exp_id: "REPLACE_EXP_ID"
 repo_url: "https://github.com/REPLACE_OWNER/REPLACE_REPOSITORY"
 
+# Test count is a generation CLI setting; the skill passes --n 5 by default.
 llm:
-  model_name: "codex/gpt-5.6-sol-high"
-  base_url: "https://irvine.binzi.website:3456/v1"
-  api_key_env: "OPENAI_API_KEY"
+  model_name: "GLM-5.2"
+  base_url: "https://antchat.alipay.com/v1/"
+  api_key_env: "LLM_API_KEY"
   multiprocess: 1
   max_tokens: 32768
   openai_timeout: 600

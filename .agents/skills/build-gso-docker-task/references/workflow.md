@@ -99,6 +99,7 @@ Generate all mapped APIs:
 
 ```bash
 python src/gso/collect/generate/generate.py "$workspace/experiment.yaml" \
+  --n 5 \
   --max_year 2022 \
   --docker-base-image gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
   --docker-repo-path ~/buckets/gso_bucket/analysis/repos/REPO_NAME \
@@ -113,6 +114,7 @@ Generate one exact API:
 python src/gso/collect/generate/generate.py \
   "$workspace/experiment.yaml" \
   --api package.target_api \
+  --n 5 \
   --max_year 2022 \
   --docker-base-image gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
   --docker-repo-path ~/buckets/gso_bucket/analysis/repos/REPO_NAME \
@@ -127,7 +129,7 @@ Expected artifact:
 ~/buckets/gso_bucket/experiments/EXP_ID/EXP_ID_problems.json
 ```
 
-The CLI is exposed through Fire. Keep generation's `--max_year` equal to the analysis cutoff; the default is `2022`. Other useful generation overrides include `--model_name`, `--multiprocess`, `--n`, `--max_tokens`, `--openai_timeout`, and `--min_loc`. Docker overrides include `--docker-image`, `--docker-base-image`, `--docker-repo-path`, `--docker-cpus`, `--docker-memory`, `--docker-platform`, `--rebuild-docker-image`, `--keep-containers`, and `--keep-workspaces`.
+The CLI is exposed through Fire. Keep generation's `--max_year` equal to the analysis cutoff; the workflow default is `2022`. Pass `--n 5` by default so each commit targets five accepted tests; override it only when the user explicitly requests another count. Other useful generation overrides include `--model_name`, `--multiprocess`, `--max_tokens`, `--openai_timeout`, and `--min_loc`. Docker overrides include `--docker-image`, `--docker-base-image`, `--docker-repo-path`, `--docker-cpus`, `--docker-memory`, `--docker-platform`, `--rebuild-docker-image`, `--keep-containers`, and `--keep-workspaces`.
 
 Generation behavior is sequential within each commit and parallel across commits:
 
@@ -135,11 +137,12 @@ Generation behavior is sequential within each commit and parallel across commits
 2. Parse and statically validate both, add the scenario to the test as comments, then execute the test against the candidate's parent and candidate in Docker.
 3. Accept the scenario only when setup, reference execution, candidate execution, and equivalence checking produce usable results.
 4. On format, static, or execution failure, feed the diagnostic back to the LLM and regenerate the complete pair from scratch, for up to three semantic retries.
-5. Include only previously accepted scenarios in the next request so the `n` tests differ materially.
+5. If all three retries for that test slot fail, preserve its diagnostics, skip the slot, and proceed to the next slot. Do not abort the commit worker or the overall task merely because one slot failed.
+6. Include only previously accepted scenarios in the next request so later tests differ materially. With the default `--n 5`, attempt all five slots even when an earlier slot is skipped; retain every accepted test, so the final count may be below five.
 
-`--multiprocess` controls concurrent commit workers, while each worker validates its `n` tests one at a time. Account for LLM and Docker load when choosing it. Generation-time validation is a correctness gate, not a stable benchmark run.
+`--multiprocess` controls concurrent commit workers, while each worker attempts its `n` test slots one at a time. Account for LLM and Docker load when choosing it. Generation-time validation is a correctness gate, not a stable benchmark run.
 
-A fully recovered retry is saved as `EXP_ID_generation_retries_<timestamp>.json`, including raw attempts, errors, scenarios, and available execution-log paths. A terminal generation failure is saved as `EXP_ID_generation_failed_<timestamp>.json`; the problems file is all-or-nothing and an existing file is not overwritten. Validation artifacts are written below:
+Retry diagnostics are saved as `EXP_ID_generation_retries_<timestamp>.json`, including raw attempts, errors, scenarios, skipped slots, and available execution-log paths. A task-level terminal generation failure is saved as `EXP_ID_generation_failed_<timestamp>.json`; an existing problems file is not overwritten. Validation artifacts are written below:
 
 ```text
 ~/buckets/gso_bucket/experiments/EXP_ID/generation_validation/

@@ -67,6 +67,7 @@ class CommitGenerationResult:
     scenarios: list[dict[str, str]] = field(default_factory=list)
     test_outputs: list[str] = field(default_factory=list)
     test_attempts: list[dict] = field(default_factory=list)
+    failed_test_slots: list[dict] = field(default_factory=list)
     error: str | None = None
 
     def diagnostic(self) -> dict:
@@ -76,6 +77,7 @@ class CommitGenerationResult:
             "scenarios": self.scenarios,
             "test_outputs": self.test_outputs,
             "test_attempts": self.test_attempts,
+            "failed_test_slots": self.failed_test_slots,
             "error": self.error,
         }
 
@@ -195,9 +197,19 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                         "may change from the rejected attempt."
                     ),
                 )
-                raw_output = get_streaming_llm_completion(request_args, attempt_payload)
-                result.test_outputs.append(raw_output)
+                raw_output = None
                 try:
+                    try:
+                        raw_output = get_streaming_llm_completion(
+                            request_args, attempt_payload
+                        )
+                    except Exception as completion_exception:
+                        raise GeneratedTestError(
+                            f"{test_context}: LLM completion raised "
+                            f"{type(completion_exception).__name__}: "
+                            f"{completion_exception}"
+                        ) from completion_exception
+                    result.test_outputs.append(raw_output)
                     scenario, generated_test = get_generated_scenario_and_test(
                         raw_output, context=test_context
                     )
@@ -229,20 +241,30 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                                 f"{execution_error}"
                             )
                 except GeneratedTestError as error:
-                    result.test_attempts.append(
-                        {
-                            "scenario": scenario.model_dump() if scenario else None,
-                            "raw_output": raw_output,
-                            "error": str(error),
-                            "execution_log": execution_log,
-                        }
-                    )
+                    attempt = {
+                        "scenario_index": scenario_index,
+                        "retry_number": retry_number,
+                        "scenario": scenario.model_dump() if scenario else None,
+                        "raw_output": raw_output,
+                        "error": str(error),
+                        "execution_log": execution_log,
+                    }
+                    result.test_attempts.append(attempt)
                     if retry_number == SEMANTIC_RETRY_COUNT:
-                        error.add_note(
-                            f"Failed after the initial request and "
-                            f"{SEMANTIC_RETRY_COUNT} semantic retries."
+                        result.failed_test_slots.append(
+                            {
+                                "scenario_index": scenario_index,
+                                "error": str(error),
+                                "execution_log": execution_log,
+                            }
                         )
-                        raise
+                        logger.error(
+                            "%s failed after the initial request and %d semantic "
+                            "retries; skipping this test slot",
+                            test_context,
+                            SEMANTIC_RETRY_COUNT,
+                        )
+                        break
                     logger.warning(
                         "%s failed validation; semantic retry %d/%d: %s",
                         test_context,
@@ -254,6 +276,8 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                     continue
                 result.test_attempts.append(
                     {
+                        "scenario_index": scenario_index,
+                        "retry_number": retry_number,
                         "scenario": scenario.model_dump(),
                         "raw_output": raw_output,
                         "error": None,
@@ -266,10 +290,10 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
 
         result.scenarios = [scenario.model_dump() for scenario in successful_scenarios]
 
-        if len(generated_tests) != task.args.n:
+        if not generated_tests:
             raise GeneratedTestError(
-                f"{task.problem.pid}/{task.commit.quick_hash()}: expected "
-                f"{task.args.n} generated test(s), got {len(generated_tests)}"
+                f"{task.problem.pid}/{task.commit.quick_hash()}: no valid tests were "
+                f"generated after attempting {task.args.n} test slot(s)"
             )
         commit_tests.add_samples(generated_tests)
         result.commit_tests = commit_tests
@@ -381,7 +405,7 @@ class PerfExpGenerator:
             return None
 
     def save_retry_diagnostics(self, outputs, args) -> Path | None:
-        """Persist recovered validation failures and their execution log paths."""
+        """Persist retry, skipped-slot, and skipped-commit diagnostics."""
         if not outputs:
             return None
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -531,18 +555,19 @@ class PerfExpGenerator:
                 generation_errors.append(f"{task_label}: {commit_result.error}")
                 failure_diagnostics.append(commit_result.diagnostic())
                 continue
-            if len(commit_result.test_attempts) > args.n:
+            if any(
+                attempt.get("error") is not None
+                for attempt in commit_result.test_attempts
+            ):
                 retry_diagnostics.append(commit_result.diagnostic())
             if commit_result.commit_tests is None:
                 error = "worker returned no commit tests"
                 generation_errors.append(f"{task_label}: {error}")
                 failure_diagnostics.append(commit_result.diagnostic())
                 continue
-            if commit_result.commit_tests.num_samples() != args.n:
-                error = (
-                    f"expected {args.n} test sample(s), got "
-                    f"{commit_result.commit_tests.num_samples()}"
-                )
+            sample_count = commit_result.commit_tests.num_samples()
+            if not 1 <= sample_count <= args.n:
+                error = f"expected 1-{args.n} test sample(s), got {sample_count}"
                 generation_errors.append(f"{task_label}: {error}")
                 failure_diagnostics.append(commit_result.diagnostic())
                 continue
@@ -561,7 +586,29 @@ class PerfExpGenerator:
                 continue
             generated_by_commit[key] = commit_result.commit_tests
 
-        if generation_errors:
+        generated_problems = []
+        for problem_index, problem in enumerate(problems):
+            successful_commit_entries = [
+                (commit_index, generated_by_commit[(problem_index, commit_index)])
+                for commit_index in range(problem.num_commits())
+                if (problem_index, commit_index) in generated_by_commit
+            ]
+            if not successful_commit_entries:
+                logger.error(
+                    "%s: no commits produced valid generated tests; skipping problem",
+                    problem.pid,
+                )
+                continue
+            problem.commits = [
+                problem.commits[commit_index]
+                for commit_index, _ in successful_commit_entries
+            ]
+            problem.set_tests(
+                [commit_tests for _, commit_tests in successful_commit_entries]
+            )
+            generated_problems.append(problem)
+
+        if not generated_problems:
             displayed_errors = generation_errors[:20]
             details = "\n".join(f"- {error}" for error in displayed_errors)
             if len(generation_errors) > len(displayed_errors):
@@ -570,7 +617,8 @@ class PerfExpGenerator:
                     "more error(s)"
                 )
             error = GeneratedTestError(
-                "Failed to generate all commit scenarios/tests:\n" + details
+                "No commits produced valid generated tests"
+                + (f":\n{details}" if details else "")
             )
             failed_path = self.save_failed_completions(failure_diagnostics, args, error)
             artifact_message = (
@@ -582,23 +630,25 @@ class PerfExpGenerator:
                 f"{error}\nExisting problems file was not modified.{artifact_message}"
             ) from error
 
-        for problem_index, problem in enumerate(problems):
-            problem.set_tests(
-                [
-                    generated_by_commit[(problem_index, commit_index)]
-                    for commit_index in range(problem.num_commits())
-                ]
+        if generation_errors:
+            logger.warning(
+                "Skipping %d generation issue(s); continuing with %d successful "
+                "commit(s)",
+                len(generation_errors),
+                len(generated_by_commit),
             )
-        validate_problem_test_samples(problems)
+
+        validate_problem_test_samples(generated_problems)
 
         results_json = f"{self.exp_id}_problems{'_DEBUG' if DEBUG_FLAG else ''}.json"
         results_path = self.exp_dir / results_json
-        save_problems_atomically(results_path, problems)
+        save_problems_atomically(results_path, generated_problems)
         print(f"Saved validated generated problems to {results_path}")
-        retry_path = self.save_retry_diagnostics(retry_diagnostics, args)
+        diagnostic_outputs = [*retry_diagnostics, *failure_diagnostics]
+        retry_path = self.save_retry_diagnostics(diagnostic_outputs, args)
         if retry_path is not None:
-            print(f"Saved recovered generation retry diagnostics to {retry_path}")
-        return problems
+            print(f"Saved generation retry/failure diagnostics to {retry_path}")
+        return generated_problems
 
 
 if __name__ == "__main__":

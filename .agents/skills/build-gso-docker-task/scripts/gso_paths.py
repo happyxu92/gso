@@ -14,6 +14,7 @@ import yaml
 
 DEFAULT_BASE_IMAGE = "gso-base:ubuntu22.04-py312-uv0.5.4-amd64"
 DEFAULT_MAX_YEAR = 2022
+DEFAULT_TESTS_PER_COMMIT = 5
 
 
 def quote(value: str | Path) -> str:
@@ -59,9 +60,17 @@ def main() -> None:
         default=DEFAULT_MAX_YEAR,
         help="Commit year cutoff passed to analysis and generation (default: 2022)",
     )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=DEFAULT_TESTS_PER_COMMIT,
+        help="Target tests per commit passed to generation (default: 5)",
+    )
     parser.add_argument("--docker-platform", default="linux/amd64")
     parser.add_argument("--rebuild-docker-image", action="store_true")
     args = parser.parse_args()
+    if args.n < 1:
+        parser.error("--n must be at least 1")
 
     yaml_path = args.yaml_path.expanduser().resolve()
     repo_root = args.repo_root.expanduser().resolve()
@@ -124,6 +133,7 @@ def main() -> None:
 
     generate_lines: list[list[str | Path]] = [
         ["python", "src/gso/collect/generate/generate.py", yaml_path],
+        ["--n", str(args.n)],
         ["--max_year", str(args.max_year)],
     ]
     if args.api:
