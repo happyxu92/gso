@@ -29,3 +29,9 @@ install_commands:
 
 repo_instr: |
   Generate deterministic CPU-only workloads and keep setup outside the timed region.
+  Each test iteration runs under a hard 300s timeout and phase 2 repeats the
+  experiment 3 times per commit, so scale inputs so the base/parent commit's
+  experiment runs in roughly 30-120 seconds (ideally ~30-60s). The measured
+  speedup is a ratio, not an absolute time, so a ~60s base run is enough to
+  expose a large speedup; prefer shrinking data volume (fewer rows / categories /
+  series / iterations) over dropping realism when a workload is too slow.

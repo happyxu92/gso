@@ -12,7 +12,7 @@ run_tests_for_commit() {
     local result_file=$2
     local flag=$3
     local prefix=$4
-    local iterations=5
+    local iterations=3
 
     echo "Running test $test_file $iterations times..."
     for i in $(seq 1 $iterations); do

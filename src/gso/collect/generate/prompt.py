@@ -92,6 +92,7 @@ if __name__ == '__main__':
 5. When using `load_dataset` API, use FULL dataset name with the `username/dataset` format: load_dataset('stanforldnlp/imdb'), load_dataset('rajpurkar/squad') etc. DO NOT use short names e.g.: load_dataset('imdb'), etc.
 6. For images, use real-world images if of appropriate size and scale. If not, create large synthetic images appropriate to the API. Note: Don't use `Image.open` with context managers and avoid mixing ranges and integers in operations.
 7. DO NOT LEAVE any placeholder inputs, code, urls, etc. DO NOT ask me to replace any values in the code. The test should be complete and runnable!
+8. Target a base-commit (parent, pre-optimization) execution time of roughly 30–120 seconds for the `experiment` function — ideally around 30–60 seconds. Each iteration runs under a hard ~300s timeout, and phase 2 repeats the experiment 3 times per commit, so a workload near the ceiling (a base run of ~200s+) leaves almost no margin for machine variance, risks the timeout silently failing that candidate's test slot, and makes one commit's repeated run take ~10+ minutes. The measured speedup is a ratio, not an absolute time, so a long base run is NOT needed to show a large speedup: a ~60s parent run that the optimization brings down to ~30s is a clean 2x signal. When a workload is too slow, prefer shrinking data volume (fewer rows / categories / series / iterations) over dropping realism, and verify the parent run lands well under 120s.
 
 # Output Format
 - The output must include a top-level `import timeit` statement.
@@ -129,6 +130,7 @@ Requirements:
 4. Use reproducible inputs and avoid uniform, sorted, repeating, or easily hackable patterns.
 5. Keep the scenario and implementation consistent; do not describe one workload and implement another.
 6. Describe how the result can be stored and compared with a reference result.
+7. Scale the workload so the base/parent commit's `experiment` run takes roughly 30–120 seconds (ideally ~30–60s), well under the ~300s per-iteration timeout. State the approximate parent-run duration and the chosen data size in the `input_characteristics` field. Because speedup is a ratio, not an absolute time, a ~60s parent run is enough to expose a large speedup; prefer shrinking data volume over dropping realism when a workload is too slow.
 
 Return exactly two fenced blocks and no explanatory text before, between, or after them.
 

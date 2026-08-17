@@ -234,6 +234,68 @@ JSON and with `<cluster>.log` under `docker_logs/generation_validation/`.
 
 Generated problems contain YAML `install_commands` when configured. If the field is absent, they contain the standard `Problem` commands. Verify the saved problems artifact contains the expected commands before execution.
 
+### Per-iteration time budget and matrix scaling
+
+Generation runs each proposed test through the same phase scripts as formal
+execution: `phase1.txt` and `phase2.txt` hardcode `timeout 300s` around every
+`python test_*.py` invocation, and `phase2.txt` repeats each reference and
+candidate run **3 times** (`iterations=3`). Target tests are disabled
+(`run_target_tests="false"` in `skymgr.py`), so each accepted slot costs **7
+timed iterations** (1 phase1 reference + 3 phase2 reference + 3 phase2
+candidate). Neither the timeout nor the iteration count is a CLI flag, so the
+lever is the **workload size the LLM produces**, guided by the prompt and
+`repo_instr`.
+
+- Size each workload so the **base/parent commit's** `experiment` run lands
+  around **30–120 s, ideally ~30–60 s**. A parent run near the 300 s ceiling
+  (for example a ~220 s chart-rendering workload over hundreds of categories)
+  leaves almost no margin for machine variance; one slow iteration trips the
+  `timeout`, the slot is silently rejected as an execution failure, and the
+  worker spends up to three LLM retries before skipping it. The generation
+  prompt and the `repo_instr` template carry this 30–120 s target — set it
+  explicitly in the YAML `repo_instr` for any repo whose natural workloads
+  trend large (charts, large dataframes, model inference, image batches).
+  Speedup is a ratio, not an absolute time, so a ~60 s parent run that the
+  optimization halves is a clean 2× signal; you do **not** need a long base
+  run to show a big speedup.
+- Estimate total generation wall-time before launching. The matrix is `--n`
+  × mapped commits × mapped APIs × ~7 timed iterations per slot, and each
+  slot can spend up to **3 semantic retries** (a retry re-runs the slot).
+  With `--n 5`, 3 commits, and 6 APIs that is 90 slots × ~7 iterations —
+  well over an hour even at ~30 s per iteration, before retries. When the
+  matrix is large, iterate cheaply with `--api package.target_api` first,
+  lower `--n` to 2–3 for a broad sweep, and raise `--multiprocess` only as
+  your LLM rate limit and Docker load allow.
+
+### Running generation and execution in the background
+
+Generation and formal execution are hour-scale and survive terminal disconnects
+poorly when run through a foreground `tee` pipeline on an SSH PTY: a dropped
+session can kill a 10-minute+ run mid-stream and waste the LLM spend and Docker
+work already done. Decouple the process from the terminal and poll by tailing
+the log instead of watching a live PTY:
+
+```bash
+# Generation: background, log to the workspace, survive shell exit
+nohup python src/gso/collect/generate/generate.py "$workspace/experiment.yaml" \
+    --n 5 --max_year 2022 \
+    --docker-base-image gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
+    --docker-repo-path ~/buckets/gso_bucket/analysis/repos/REPO_NAME \
+    --docker-image gso-EXP_ID:latest \
+    --docker-platform linux/amd64 \
+    > "$workspace/logs/04-generate.log" 2>&1 &
+echo $! > "$workspace/logs/04-generate.pid"
+tail -f "$workspace/logs/04-generate.log"   # Ctrl-C stops only the tail
+```
+
+`setsid ... &` or a `tmux`/`screen` session are equivalent alternatives. The
+same pattern applies to `execute.py` (section 5), which also repeats phase2 3×
+and exposes `--poll-interval`; choose `--poll-interval 5` (or higher) for long
+runs and background it. After an interruption, resume inspection with `tail`,
+`grep`, or the retries/result JSON rather than re-running — an in-flight
+generation that wrote `_problems.json` is not overwritten by a later failed
+run, but a re-run still re-spends LLM calls for any slot not yet accepted.
+
 ## 5. Docker execution
 
 Prefer the exact local analysis checkout:
@@ -254,7 +316,7 @@ python src/gso/collect/execute/execute.py \
   2>&1 | tee "$workspace/logs/06-execute.log"
 ```
 
-Add `--api package.target_api` to run one API. Add `--rebuild-docker-image` to append Docker's `--no-cache`. Optional controls include `--docker-cpus`, `--docker-memory`, `--runs`, `--keep-containers`, `--keep-workspaces`, and `--poll-interval`. `--keep-workspaces` retains the per-task host workspace (phase scripts and `<quick_hash>/test_*.py`) for the same diagnostic reasons as generation (see section 4); the default deletes it on completion, leaving only the container log under `docker_logs/`.
+Add `--api package.target_api` to run one API. Add `--rebuild-docker-image` to append Docker's `--no-cache`. Optional controls include `--docker-cpus`, `--docker-memory`, `--runs`, `--keep-containers`, `--keep-workspaces`, and `--poll-interval`. `--keep-workspaces` retains the per-task host workspace (phase scripts and `<quick_hash>/test_*.py`) for the same diagnostic reasons as generation (see section 4); the default deletes it on completion, leaving only the container log under `docker_logs/`. Formal execution repeats phase2 3× per slot under the same `timeout 300s`, so the 30–120 s base-run target and the background `nohup` + `tail -f` pattern from section 4 apply here too; pick a `--poll-interval` (e.g. `5`) that keeps log spam low over an hour-scale run.
 
 When `--docker-base-image` is supplied, execution builds the repository image. With `--docker-repo-path`, it copies the entire local checkout, including `.git`, into `/workspace/REPO_NAME`. Without `--docker-repo-path`, the repository image clones `repo_url` remotely. Omitting `--docker-base-image` requires `--docker-image` to exist already.
 
