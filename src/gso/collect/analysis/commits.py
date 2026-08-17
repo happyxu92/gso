@@ -428,9 +428,8 @@ class PerfCommitAnalyzer:
             print("No new commits to analyze")
             return []
 
-        # ask user if they want to proceed with LLM analysis on XX commits
-        if not prompt_yes_no("Proceed with LLM analysis on these commits?"):
-            return []
+        # Proceed with LLM analysis without prompting. Non-interactive mode.
+        print("Proceeding with LLM analysis (non-interactive mode)")
 
         # Record every commit sent for analysis, including commits rejected by the LLM.
         # This prevents rejected candidates from being analyzed again on the next run.
