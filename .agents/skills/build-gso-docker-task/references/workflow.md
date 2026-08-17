@@ -247,22 +247,22 @@ lever is the **workload size the LLM produces**, guided by the prompt and
 `repo_instr`.
 
 - Size each workload so the **base/parent commit's** `experiment` run lands
-  around **30–120 s, ideally ~30–60 s**. A parent run near the 300 s ceiling
+  around **1–60 s, ideally ~1–30 s**. A parent run near the 300 s ceiling
   (for example a ~220 s chart-rendering workload over hundreds of categories)
   leaves almost no margin for machine variance; one slow iteration trips the
   `timeout`, the slot is silently rejected as an execution failure, and the
   worker spends up to three LLM retries before skipping it. The generation
-  prompt and the `repo_instr` template carry this 30–120 s target — set it
+  prompt and the `repo_instr` template carry this 1–60 s target — set it
   explicitly in the YAML `repo_instr` for any repo whose natural workloads
   trend large (charts, large dataframes, model inference, image batches).
-  Speedup is a ratio, not an absolute time, so a ~60 s parent run that the
+  Speedup is a ratio, not an absolute time, so a ~30 s parent run that the
   optimization halves is a clean 2× signal; you do **not** need a long base
   run to show a big speedup.
 - Estimate total generation wall-time before launching. The matrix is `--n`
   × mapped commits × mapped APIs × ~7 timed iterations per slot, and each
   slot can spend up to **3 semantic retries** (a retry re-runs the slot).
   With `--n 5`, 3 commits, and 6 APIs that is 90 slots × ~7 iterations —
-  well over an hour even at ~30 s per iteration, before retries. When the
+  well over an hour even at ~15 s per iteration, before retries. When the
   matrix is large, iterate cheaply with `--api package.target_api` first,
   lower `--n` to 2–3 for a broad sweep, and raise `--multiprocess` only as
   your LLM rate limit and Docker load allow.
