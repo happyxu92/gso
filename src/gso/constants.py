@@ -38,3 +38,15 @@ LOW_TEST_FALLBACK_SPEEDUP = 1.1  # min speedup for problems with low test count
 # --------- Grading Constants ---------
 OPT_THRESH = 0.95  # min speedup to consider as `matching or exceeding` commit perf
 HIGH_RESOURCE_REPOS = ["abetlen/llama-cpp-python", "huggingface/tokenizers"]
+
+# --------- LLM Cache Stage Names ---------
+# Stage keys allowed under the shared `llm.cache` YAML section. Analysis
+# (commits.py) owns commit_filter/affected_files/api_identification; generation
+# (generate.py) owns test_generation. Each module reads its own stages and
+# tolerates the others, but rejects genuinely unknown stage names as typos.
+LLM_CACHE_STAGES = {
+    "commit_filter",
+    "affected_files",
+    "api_identification",
+    "test_generation",
+}

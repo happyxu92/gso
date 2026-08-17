@@ -54,7 +54,9 @@ Required identity fields are `exp_id` and `repo_url`. Recommended local-Docker f
 - `multiprocess`
 - `max_tokens`
 - `openai_timeout`
-- `cache.commit_filter`, `cache.affected_files`, and `cache.api_identification`
+- `cache.commit_filter`, `cache.affected_files`, `cache.api_identification`, and `cache.test_generation`
+
+`cache.test_generation` defaults to `false` so generation hits the live endpoint instead of reusing stale disk-cache entries; set it to `true` to reuse prior LLM completions.
 
 `api_docs` guides public API identification. Do not add a YAML `max_commits` field: the default single-repository workflow processes every matching commit after the year cutoff instead of truncating the candidate list.
 

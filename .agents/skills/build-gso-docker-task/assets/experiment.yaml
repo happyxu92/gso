@@ -14,6 +14,7 @@ llm:
     commit_filter: true
     affected_files: true
     api_identification: true
+    test_generation: false
 
 api_docs: |
   Focus on public Python APIs exposed by the repository.

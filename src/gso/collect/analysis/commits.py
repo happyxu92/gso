@@ -56,7 +56,7 @@ class PerfCommitAnalyzer:
         if not isinstance(cache_config, dict):
             raise ValueError("llm.cache must be a YAML mapping")
 
-        unknown_stages = cache_config.keys() - DEFAULT_LLM_CACHE_SETTINGS.keys()
+        unknown_stages = cache_config.keys() - LLM_CACHE_STAGES
         if unknown_stages:
             stages = ", ".join(sorted(unknown_stages))
             raise ValueError(f"Unsupported llm.cache stage(s): {stages}")
@@ -75,8 +75,8 @@ class PerfCommitAnalyzer:
         cls.model_name = configured.model_name
         cls.llm_multiprocess = configured.multiprocess
         cls.llm_cache_settings = {
-            **DEFAULT_LLM_CACHE_SETTINGS,
-            **cache_config,
+            stage: cache_config.get(stage, default)
+            for stage, default in DEFAULT_LLM_CACHE_SETTINGS.items()
         }
 
     @staticmethod

@@ -12,7 +12,12 @@ import fire
 from r2e.multiprocess import run_tasks_in_parallel
 from gso.data import PerformanceCommit, Problem, Repo, Tests
 from gso.logger import logger
-from gso.constants import ANALYSIS_APIS_DIR, ANALYSIS_REPOS_DIR, EXPS_DIR
+from gso.constants import (
+    ANALYSIS_APIS_DIR,
+    ANALYSIS_REPOS_DIR,
+    EXPS_DIR,
+    LLM_CACHE_STAGES,
+)
 from gso.collect.execute.execute import (
     GeneratedTestExecutionConfig,
     evaluate_generated_test,
@@ -33,6 +38,9 @@ IS_RERUN_FLAG = False  # NOTE: runs testgen for valid probs from previous run
 DEBUG_FLAG = False  # NOTE: debug flag to not overwrite existing tests
 REASONING_MODELS = {"o1-mini", "o3-mini", "o1-preview", "o4-mini"}
 SEMANTIC_RETRY_COUNT = 3
+DEFAULT_GENERATION_LLM_CACHE_SETTINGS = {
+    "test_generation": False,
+}
 
 
 def create_generation_problem(
@@ -375,6 +383,7 @@ class PerfExpGenerator:
 
     def __init__(self, args):
         self.config = load_exp_config(args.yaml_path)
+        self.llm_cache_settings = DEFAULT_GENERATION_LLM_CACHE_SETTINGS.copy()
         self.configure_llm(args)
         self.exp_id = self.config["exp_id"]
         self.repo = Repo.from_url(self.config["repo_url"])
@@ -387,15 +396,48 @@ class PerfExpGenerator:
         self.exp_dir = EXPS_DIR / self.exp_id
 
     def configure_llm(self, args) -> None:
-        """Apply optional experiment LLM settings to test generation."""
-        llm_config = self.config.get("llm")
-        if llm_config is None:
-            return
+        """Apply optional experiment LLM settings to test generation.
+
+        Per-stage caching is read from ``llm.cache`` (mirroring ``commits.py``).
+        Generation defaults to ``False`` so repeated runs hit the live endpoint
+        instead of reusing stale disk-cache entries; an explicit ``--use_cache``
+        CLI flag always takes precedence over the YAML setting.
+        """
+        raw_llm_config = self.config.get("llm")
+        llm_config = raw_llm_config if raw_llm_config is not None else {}
         if not isinstance(llm_config, dict):
             raise ValueError("The 'llm' experiment setting must be a YAML mapping")
 
-        effective_llm_config = dict(llm_config)
+        cache_config = llm_config.get("cache", {})
+        if cache_config is None:
+            cache_config = {}
+        if not isinstance(cache_config, dict):
+            raise ValueError("llm.cache must be a YAML mapping")
+        unknown_stages = cache_config.keys() - LLM_CACHE_STAGES
+        if unknown_stages:
+            stages = ", ".join(sorted(unknown_stages))
+            raise ValueError(f"Unsupported llm.cache stage(s): {stages}")
+        for stage, value in cache_config.items():
+            if not isinstance(value, bool):
+                raise ValueError(f"llm.cache.{stage} must be a boolean")
+        self.llm_cache_settings = {
+            stage: cache_config.get(stage, default)
+            for stage, default in DEFAULT_GENERATION_LLM_CACHE_SETTINGS.items()
+        }
+
         explicit_fields = getattr(args, "model_fields_set", set())
+        if "use_cache" in explicit_fields:
+            self.llm_cache_settings = {
+                **self.llm_cache_settings,
+                "test_generation": args.use_cache,
+            }
+        else:
+            args.use_cache = self.llm_cache_settings["test_generation"]
+
+        if raw_llm_config is None:
+            return
+
+        effective_llm_config = dict(llm_config)
         if "model_name" in explicit_fields:
             effective_llm_config["model_name"] = args.model_name
         if "multiprocess" in explicit_fields:
