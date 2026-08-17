@@ -29,7 +29,12 @@ Create the workspace before writing configuration or starting analysis, then ins
 ```bash
 test -d src/gso
 python --version
-python -c 'import gso; print(gso.__file__)'
+# Real self-check: import the actual generation and execution entry points
+# with PYTHONPATH unset so they resolve from the installed package instead
+# of a shadowing src/ via PYTHONPATH. A bare `import gso` is not enough —
+# this exercises every dependency the generation and execution entry points
+# pull in (including diskcache).
+env -u PYTHONPATH python -c "from gso.collect.generate.generate import *; from gso.collect.execute.execute import evaluate_generated_test"
 docker info --format '{{.Architecture}}'
 docker image inspect gso-base:ubuntu22.04-py312-uv0.5.4-amd64
 ```
