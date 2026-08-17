@@ -314,9 +314,29 @@ class ExecutionManager:
                 except Exception as exc:
                     print(f"WARNING: cleanup failed for {cluster}: {exc}", flush=True)
 
-        if not self.keep_workspaces:
+        if self.keep_workspaces:
+            # Surface each retained workspace on stdout with enough pid/commit
+            # context to map it back to a specific attempt. By default these per
+            # test host workspaces (phase scripts + <quick_hash>/test_*.py) are
+            # rmtree'd as soon as the container exits, leaving only the container
+            # log. Operators set --keep-workspaces specifically to tell a test
+            # that never ran from a path/glob mistake (e.g. the //<hash>/test_*.py
+            # signature) by inspecting the retained layout, so announce where it
+            # lives instead of leaving it as an anonymous tempdir to find.
             for state in self.tasks.values():
-                self.runtime.cleanup_workspace(state.workspace)
+                quick_hashes = ",".join(
+                    test.quick_hash for test in state.problem.tests
+                )
+                print(
+                    f"Kept workspace for {state.problem.pid} "
+                    f"(commit(s) {quick_hashes}, run {state.run_index + 1}): "
+                    f"{state.workspace}",
+                    flush=True,
+                )
+            return
+
+        for state in self.tasks.values():
+            self.runtime.cleanup_workspace(state.workspace)
 
     def all_tasks_complete(self) -> bool:
         return bool(self.tasks) and all(

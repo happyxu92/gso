@@ -196,6 +196,42 @@ Retry diagnostics are saved as `EXP_ID_generation_retries_<timestamp>.json`, inc
 ~/buckets/gso_bucket/experiments/EXP_ID/docker_logs/generation_validation/repository_image/build.log
 ```
 
+### Diagnostic value of `--keep-workspaces`
+
+With `--keep-workspaces` omitted (the default), each per-test validation
+workspace is `shutil.rmtree`'d the moment its container exits. Only two
+per-test artifacts survive: the container log under
+`docker_logs/generation_validation/<cluster>.log` and the attempt record in
+`EXP_ID_generation_retries_<timestamp>.json`. The host workspace that was
+`docker cp`'d into the container — `phase1.sh`, `phase2.sh`,
+`<pid>_task.yaml`, and one `<quick_hash>/test_i.py` per sampled test — is
+gone, so from the log alone it is hard to tell a test that was never written
+or failed to parse from a working-directory/glob mistake such as the
+`python: can't open file '//<hash>/test_*.py'` signature. Listing the flag as
+optional is correct for a healthy run (which keeps nothing extra); the
+diagnostic value matters only while a `generation_validation` is failing.
+
+Turn on `--keep-workspaces` (ideally scoped with `--api <failing_api>` and the
+same `--n`/`--max_year` so you do not retain a workspace for every retry
+across every commit) to retain the exact on-disk layout the container saw:
+
+- Confirm `test_0.py` really landed under `<quick_hash>/`, i.e. the test was
+  written and parseable rather than lost in generation/parsing.
+- Read the expanded `phase1.sh` / `phase2.sh` with `install_commands`
+  interpolated verbatim — the fastest way to spot a `cd` that leaked the cwd
+  and broke the `cd .. ; <hash>/test_*.py` glob (see the install_commands
+  working-directory contract in section 3).
+- Reproduce the container layout locally without rebuilding the image.
+
+A retained workspace is small: only phase scripts and per-commit `test_*.py`.
+The repository itself lives in the Docker image, not the workspace, so
+retention is cheap; reach for `--keep-containers` instead only when you need
+the full container filesystem or an interactive `docker exec`. Each retained
+workspace is announced on stdout as `Kept workspace for <pid> (commit(s)
+<quick_hash>, run <n>): <path>`; correlate that path and the `test_0.py`
+contents with the matching `raw_output`/`execution_log` entry in the retries
+JSON and with `<cluster>.log` under `docker_logs/generation_validation/`.
+
 Generated problems contain YAML `install_commands` when configured. If the field is absent, they contain the standard `Problem` commands. Verify the saved problems artifact contains the expected commands before execution.
 
 ## 5. Docker execution
@@ -218,7 +254,7 @@ python src/gso/collect/execute/execute.py \
   2>&1 | tee "$workspace/logs/06-execute.log"
 ```
 
-Add `--api package.target_api` to run one API. Add `--rebuild-docker-image` to append Docker's `--no-cache`. Optional controls include `--docker-cpus`, `--docker-memory`, `--runs`, `--keep-containers`, `--keep-workspaces`, and `--poll-interval`.
+Add `--api package.target_api` to run one API. Add `--rebuild-docker-image` to append Docker's `--no-cache`. Optional controls include `--docker-cpus`, `--docker-memory`, `--runs`, `--keep-containers`, `--keep-workspaces`, and `--poll-interval`. `--keep-workspaces` retains the per-task host workspace (phase scripts and `<quick_hash>/test_*.py`) for the same diagnostic reasons as generation (see section 4); the default deletes it on completion, leaving only the container log under `docker_logs/`.
 
 When `--docker-base-image` is supplied, execution builds the repository image. With `--docker-repo-path`, it copies the entire local checkout, including `.git`, into `/workspace/REPO_NAME`. Without `--docker-repo-path`, the repository image clones `repo_url` remotely. Omitting `--docker-base-image` requires `--docker-image` to exist already.
 
