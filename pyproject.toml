@@ -29,6 +29,8 @@ dependencies = [
     "openai>=2.4.0",
     "python-dotenv>=1.1.0",
     "socksio>=1.0.0",
+    "tiktoken>=0.13.0",
+    "r2e @ git+https://github.com/r2e-project/r2e",
 ]
 
 [build-system]
