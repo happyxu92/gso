@@ -1,4 +1,0 @@
-interface:
-  display_name: "构建 GSO Docker Task"
-  short_description: "从仓库分析到本地 Docker 数据集的完整 GSO 构建流程"
-  default_prompt: "使用 $build-gso-docker-task 为指定 Python 仓库构建并验证本地 Docker GSO Task。"

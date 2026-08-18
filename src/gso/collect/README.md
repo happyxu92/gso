@@ -175,7 +175,7 @@ default).
   -j 3 --max-year 2022 -n 5
 ```
 
-The config is rendered from the [experiment template](/.agents/skills/build-gso-docker-task/assets/experiment.yaml)
+The config is rendered from the [experiment template](/assets/experiment.yaml)
 with `exp_id`/`repo_url` filled in; existing configs are reused unless
 `--overwrite-config` is passed. Stage selection (`--stages`) lets you run pieces
 independently — for example analysis only, or generation on its own (which

@@ -65,19 +65,13 @@ from zoneinfo import ZoneInfo
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).resolve().parent  # src/gso/collect
 _REPO_ROOT = _THIS_DIR.parents[2]  # GSO repository root
-_DEFAULT_TEMPLATE = (
-    _REPO_ROOT
-    / ".agents"
-    / "skills"
-    / "build-gso-docker-task"
-    / "assets"
-    / "experiment.yaml"
-)
+_DEFAULT_TEMPLATE = _REPO_ROOT / "assets" / "experiment.yaml"
 
 DEFAULT_BUCKETS_DIR = Path.home() / "buckets"
 DEFAULT_BASE_IMAGE = "gso-base:ubuntu22.04-py312-uv0.5.4-amd64"
 DEFAULT_DOCKER_PLATFORM = "linux/amd64"
 DEFAULT_MAX_YEAR = 2022
+DEFAULT_MAX_COMMITS = 300
 DEFAULT_TESTS_PER_COMMIT = 5
 DEFAULT_EXEC_MACHINES = 1
 DEFAULT_CONCURRENCY = 3
@@ -188,8 +182,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--max-commits",
         type=int,
-        default=None,
-        help="cap the newest candidate commits analyzed",
+        default=DEFAULT_MAX_COMMITS,
+        help=(
+            "cap the newest candidate commits analyzed "
+            f"(default: {DEFAULT_MAX_COMMITS})"
+        ),
     )
     p.add_argument(
         "-n",
