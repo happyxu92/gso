@@ -105,7 +105,7 @@ def test_prepare_workspace_only_updates_key_in_existing_config(tmp_path):
     assert 'api_key_env: "LLM_API_KEY_2"  # credential source' in updated
 
 
-def test_run_command_relays_generation_progress_without_verbose(tmp_path, capsys):
+def test_run_command_relays_generation_output_without_verbose(tmp_path, capsys):
     log_path = tmp_path / "generate.log"
     command = [
         sys.executable,
@@ -114,6 +114,8 @@ def test_run_command_relays_generation_progress_without_verbose(tmp_path, capsys
             "import sys; print('ordinary subprocess output'); "
             "sys.stderr.write('\\rGenerating commit tests: 0%'); "
             "sys.stderr.flush(); "
+            "print('Generation event: repo.api/abcdef1 scenario/test 1 requesting test', "
+            "file=sys.stderr, flush=True); "
             "print('Generation progress: repo.api/abcdef1 test 1/2 accepted', "
             "file=sys.stderr, flush=True)"
         ),
@@ -123,11 +125,16 @@ def test_run_command_relays_generation_progress_without_verbose(tmp_path, capsys
 
     assert return_code == 0
     console_lines = capsys.readouterr().out.splitlines()
-    assert len(console_lines) == 1
+    assert len(console_lines) == 2
+    assert re.fullmatch(
+        rf"{TIMESTAMP_RE} \[repo\] Generation event: "
+        r"repo\.api/abcdef1 scenario/test 1 requesting test",
+        console_lines[0],
+    )
     assert re.fullmatch(
         rf"{TIMESTAMP_RE} \[repo\] Generation progress: "
         r"repo\.api/abcdef1 test 1/2 accepted",
-        console_lines[0],
+        console_lines[1],
     )
     console = "\n".join(console_lines)
     assert "ordinary subprocess output" not in console
@@ -136,6 +143,9 @@ def test_run_command_relays_generation_progress_without_verbose(tmp_path, capsys
     assert all(re.match(rf"{TIMESTAMP_RE} ", line) for line in log_lines)
     log_text = "\n".join(log_lines)
     assert "ordinary subprocess output" in log_text
+    assert (
+        "Generation event: repo.api/abcdef1 scenario/test 1 requesting test" in log_text
+    )
     assert "Generation progress: repo.api/abcdef1 test 1/2 accepted" in log_text
 
 

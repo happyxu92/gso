@@ -42,6 +42,12 @@ DEFAULT_GENERATION_LLM_CACHE_SETTINGS = {
     "test_generation": False,
 }
 GENERATION_PROGRESS_PREFIX = "Generation progress:"
+GENERATION_EVENT_PREFIX = "Generation event:"
+
+
+def log_generation_event(test_context: str, event: str) -> None:
+    """Emit a structured lifecycle event that run_pipeline.py can relay."""
+    print(f"{GENERATION_EVENT_PREFIX} {test_context} {event}", flush=True)
 
 
 def create_generation_problem(
@@ -253,6 +259,14 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                 )
                 raw_output = None
                 try:
+                    if retry_number == 0:
+                        log_generation_event(test_context, "requesting test")
+                    else:
+                        log_generation_event(
+                            test_context,
+                            f"re-requesting test (semantic retry "
+                            f"{retry_number}/{SEMANTIC_RETRY_COUNT})",
+                        )
                     try:
                         raw_output = get_llm_completion(
                             request_args,
@@ -274,6 +288,11 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                         scenario,
                     )
                     if task.execution_config is not None:
+                        log_generation_event(
+                            test_context,
+                            f"starting test (attempt {retry_number + 1}/"
+                            f"{SEMANTIC_RETRY_COUNT + 1})",
+                        )
                         try:
                             execution_result = evaluate_generated_test(
                                 task.problem,
@@ -282,6 +301,12 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                                 task.execution_config,
                             )
                         except Exception as execution_exception:
+                            log_generation_event(
+                                test_context,
+                                "test failed "
+                                f"({type(execution_exception).__name__}: "
+                                f"{execution_exception})",
+                            )
                             raise GeneratedTestError(
                                 f"{test_context}: automated execution raised "
                                 f"{type(execution_exception).__name__}: "
@@ -292,10 +317,20 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                             execution_error = execution_result.error or (
                                 "Generated test execution failed without diagnostics"
                             )
+                            log_generation_event(
+                                test_context,
+                                "test failed"
+                                + (
+                                    f" (log: {execution_log})"
+                                    if execution_log is not None
+                                    else ""
+                                ),
+                            )
                             raise GeneratedTestError(
                                 f"{test_context}: automated execution failed:\n"
                                 f"{execution_error}"
                             )
+                        log_generation_event(test_context, "test passed")
                 except GeneratedTestError as error:
                     attempt = {
                         "scenario_index": scenario_index,

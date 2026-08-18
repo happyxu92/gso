@@ -101,6 +101,11 @@ _API_KEY_ENV_LINE_RE = re.compile(
     re.MULTILINE,
 )
 _GENERATION_PROGRESS_PREFIX = "Generation progress:"
+_GENERATION_EVENT_PREFIX = "Generation event:"
+_GENERATION_OUTPUT_PREFIXES = (
+    _GENERATION_PROGRESS_PREFIX,
+    _GENERATION_EVENT_PREFIX,
+)
 
 
 def timestamped(msg: str) -> str:
@@ -669,12 +674,20 @@ def run_command(
                 logf.write(timestamped(output_line) + "\n")
                 if verbose:
                     log(f"[{repo_label}] {output_line}")
-                elif _GENERATION_PROGRESS_PREFIX in output_line:
-                    # Keep normal mode quiet except for the structured generate
-                    # progress records added by generate.py.
-                    marker_index = output_line.rfind(_GENERATION_PROGRESS_PREFIX)
-                    progress = output_line[marker_index:]
-                    log(f"[{repo_label}] {progress}")
+                else:
+                    # Keep normal mode quiet except for the structured progress
+                    # and lifecycle records added by generate.py.
+                    matching_prefixes = [
+                        prefix
+                        for prefix in _GENERATION_OUTPUT_PREFIXES
+                        if prefix in output_line
+                    ]
+                    if matching_prefixes:
+                        marker_index = max(
+                            output_line.rfind(prefix) for prefix in matching_prefixes
+                        )
+                        generation_output = output_line[marker_index:]
+                        log(f"[{repo_label}] {generation_output}")
             logf.flush()
         proc.wait()
     return proc.returncode, time.time() - started

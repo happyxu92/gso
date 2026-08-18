@@ -9,6 +9,7 @@ from gso.collect.generate.args import PerfExpGenArgs
 from gso.collect.generate.generate import (
     CommitGenerationResult,
     CommitGenerationTask,
+    GENERATION_EVENT_PREFIX,
     GENERATION_PROGRESS_PREFIX,
     PerfExpGenerator,
     SEMANTIC_RETRY_COUNT,
@@ -518,7 +519,7 @@ def test_commit_worker_retries_invalid_test_without_cache(monkeypatch):
     assert "missing required function" in retry_instruction
 
 
-def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch):
+def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch, capsys):
     repo = Repo(
         repo_url="https://github.com/example/repo",
         repo_owner="example",
@@ -594,6 +595,30 @@ def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch):
     retry_instruction = completion_calls[1][1][-1]["content"]
     assert "semantic retry 1 of 3" in retry_instruction
     assert "candidate output differs from reference" in retry_instruction
+    assert capsys.readouterr().out.splitlines() == [
+        f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 requesting test",
+        (
+            f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 "
+            "starting test (attempt 1/4)"
+        ),
+        (
+            f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 "
+            "test failed (log: /tmp/test-execution.log)"
+        ),
+        (
+            f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 "
+            "re-requesting test (semantic retry 1/3)"
+        ),
+        (
+            f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 "
+            "starting test (attempt 2/4)"
+        ),
+        f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 test passed",
+        (
+            f"{GENERATION_PROGRESS_PREFIX} repo.target/abcdef1 test 1/1 accepted "
+            "(accepted=1, skipped=0)"
+        ),
+    ]
 
 
 def test_commit_worker_skips_failed_test_slot_and_continues(monkeypatch, capsys):
@@ -671,7 +696,10 @@ def test_commit_worker_skips_failed_test_slot_and_continues(monkeypatch, capsys)
     assert result.test_attempts[-1]["scenario_index"] == 2
     assert result.test_attempts[-1]["error"] is None
     assert "# title: second" in result.commit_tests.samples[0]
-    assert capsys.readouterr().out.splitlines() == [
+    output_lines = capsys.readouterr().out.splitlines()
+    assert [
+        line for line in output_lines if line.startswith(GENERATION_PROGRESS_PREFIX)
+    ] == [
         (
             f"{GENERATION_PROGRESS_PREFIX} repo.target/abcdef1 test 1/2 skipped "
             "(accepted=0, skipped=1)"
