@@ -41,6 +41,7 @@ SEMANTIC_RETRY_COUNT = 3
 DEFAULT_GENERATION_LLM_CACHE_SETTINGS = {
     "test_generation": False,
 }
+GENERATION_PROGRESS_PREFIX = "Generation progress:"
 
 
 def create_generation_problem(
@@ -209,6 +210,7 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
         successful_scenarios: list[TestScenario] = []
         failed_scenarios: list[dict] = []
         for scenario_index in range(1, task.args.n + 1):
+            slot_status = "skipped"
             combined_task = SCENARIO_TEST_MSG.format(
                 api=task.problem.api,
                 repo_name=task.repo.repo_name,
@@ -341,7 +343,20 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                 )
                 generated_tests.append(generated_test)
                 successful_scenarios.append(scenario)
+                slot_status = "accepted"
                 break
+
+            # tqdm's carriage-return updates are not visible while generate.py is
+            # captured by run_pipeline.py. Emit one newline-delimited record per
+            # completed slot so the pipeline can relay useful progress without
+            # enabling its otherwise noisy --verbose output.
+            print(
+                f"{GENERATION_PROGRESS_PREFIX} {task.problem.pid}/"
+                f"{task.commit.quick_hash()} test {scenario_index}/{task.args.n} "
+                f"{slot_status} (accepted={len(generated_tests)}, "
+                f"skipped={len(result.failed_test_slots)})",
+                flush=True,
+            )
 
         result.scenarios = [scenario.model_dump() for scenario in successful_scenarios]
 

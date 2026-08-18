@@ -55,8 +55,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Repo-relative locations
@@ -79,6 +81,7 @@ DEFAULT_MAX_YEAR = 2022
 DEFAULT_TESTS_PER_COMMIT = 5
 DEFAULT_EXEC_MACHINES = 1
 DEFAULT_CONCURRENCY = 3
+BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 # Canonical pipeline order. Filtering preserves this order.
 STAGES = ("commits", "apis", "generate", "execute", "evaluate")
@@ -103,12 +106,19 @@ _API_KEY_ENV_LINE_RE = re.compile(
     r"[^#\r\n]*?(?P<comment>[ \t]+#.*)?$",
     re.MULTILINE,
 )
+_GENERATION_PROGRESS_PREFIX = "Generation progress:"
+
+
+def timestamped(msg: str) -> str:
+    """Prefix a message with the current Beijing time in ISO 8601 format."""
+    timestamp = datetime.now(BEIJING_TIMEZONE).isoformat(timespec="seconds")
+    return f"[{timestamp}] {msg}"
 
 
 def log(msg: str) -> None:
-    """Thread-safe console print."""
+    """Thread-safe, timestamped console print."""
     with _PRINT_LOCK:
-        print(msg, flush=True)
+        print(timestamped(msg), flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +646,7 @@ def run_command(
     header = "$ " + " ".join(shlex.quote(str(token)) for token in command)
     started = time.time()
     with log_path.open("w", encoding="utf-8") as logf:
-        logf.write(header + "\n")
+        logf.write(timestamped(header) + "\n")
         logf.flush()
         proc = subprocess.Popen(
             command,
@@ -651,12 +661,24 @@ def run_command(
             line = proc.stdout.readline()
             if line == "":
                 break
-            logf.write(line)
+            # tqdm redraws a single terminal row with carriage returns. Turn
+            # those redraws into ordinary lines so every captured update can
+            # carry its own timestamp in the persistent stage log.
+            normalized_line = line.replace("\r\n", "\n").replace("\r", "\n")
+            output_lines = normalized_line.splitlines()
+            if not output_lines:
+                output_lines = [""]
+            for output_line in output_lines:
+                logf.write(timestamped(output_line) + "\n")
+                if verbose:
+                    log(f"[{repo_label}] {output_line}")
+                elif _GENERATION_PROGRESS_PREFIX in output_line:
+                    # Keep normal mode quiet except for the structured generate
+                    # progress records added by generate.py.
+                    marker_index = output_line.rfind(_GENERATION_PROGRESS_PREFIX)
+                    progress = output_line[marker_index:]
+                    log(f"[{repo_label}] {progress}")
             logf.flush()
-            if verbose:
-                with _PRINT_LOCK:
-                    sys.stdout.write(f"[{repo_label}] {line}")
-                    sys.stdout.flush()
         proc.wait()
     return proc.returncode, time.time() - started
 

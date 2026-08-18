@@ -9,6 +9,7 @@ from gso.collect.generate.args import PerfExpGenArgs
 from gso.collect.generate.generate import (
     CommitGenerationResult,
     CommitGenerationTask,
+    GENERATION_PROGRESS_PREFIX,
     PerfExpGenerator,
     SEMANTIC_RETRY_COUNT,
     create_generation_problem,
@@ -507,7 +508,7 @@ def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch):
     assert "candidate output differs from reference" in retry_instruction
 
 
-def test_commit_worker_skips_failed_test_slot_and_continues(monkeypatch):
+def test_commit_worker_skips_failed_test_slot_and_continues(monkeypatch, capsys):
     repo = Repo(
         repo_url="https://github.com/example/repo",
         repo_owner="example",
@@ -582,6 +583,16 @@ def test_commit_worker_skips_failed_test_slot_and_continues(monkeypatch):
     assert result.test_attempts[-1]["scenario_index"] == 2
     assert result.test_attempts[-1]["error"] is None
     assert "# title: second" in result.commit_tests.samples[0]
+    assert capsys.readouterr().out.splitlines() == [
+        (
+            f"{GENERATION_PROGRESS_PREFIX} repo.target/abcdef1 test 1/2 skipped "
+            "(accepted=0, skipped=1)"
+        ),
+        (
+            f"{GENERATION_PROGRESS_PREFIX} repo.target/abcdef1 test 2/2 accepted "
+            "(accepted=1, skipped=1)"
+        ),
+    ]
 
 
 def test_generator_skips_failed_commit_and_saves_successful_commit(

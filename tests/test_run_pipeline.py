@@ -1,3 +1,6 @@
+import re
+import sys
+
 import pytest
 
 from gso.collect.run_pipeline import (
@@ -5,6 +8,8 @@ from gso.collect.run_pipeline import (
     normalize_api_key_envs,
     prepare_workspace,
     render_config,
+    run_command,
+    timestamped,
 )
 
 
@@ -15,6 +20,11 @@ llm:
   model_name: "test-model"
   api_key_env: "LLM_API_KEY"  # credential source
 """
+TIMESTAMP_RE = r"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+08:00\]"
+
+
+def test_timestamped_uses_beijing_iso_8601_time():
+    assert re.fullmatch(rf"{TIMESTAMP_RE} message", timestamped("message"))
 
 
 def test_normalize_api_key_envs_accepts_commas_and_repeated_values():
@@ -84,3 +94,58 @@ def test_prepare_workspace_only_updates_key_in_existing_config(tmp_path):
     updated = result.read_text(encoding="utf-8")
     assert 'model_name: "custom"' in updated
     assert 'api_key_env: "LLM_API_KEY_2"  # credential source' in updated
+
+
+def test_run_command_relays_generation_progress_without_verbose(tmp_path, capsys):
+    log_path = tmp_path / "generate.log"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; print('ordinary subprocess output'); "
+            "sys.stderr.write('\\rGenerating commit tests: 0%'); "
+            "sys.stderr.flush(); "
+            "print('Generation progress: repo.api/abcdef1 test 1/2 accepted', "
+            "file=sys.stderr, flush=True)"
+        ),
+    ]
+
+    return_code, _ = run_command(command, log_path, "repo", verbose=False)
+
+    assert return_code == 0
+    console_lines = capsys.readouterr().out.splitlines()
+    assert len(console_lines) == 1
+    assert re.fullmatch(
+        rf"{TIMESTAMP_RE} \[repo\] Generation progress: "
+        r"repo\.api/abcdef1 test 1/2 accepted",
+        console_lines[0],
+    )
+    console = "\n".join(console_lines)
+    assert "ordinary subprocess output" not in console
+    log_lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert log_lines
+    assert all(re.match(rf"{TIMESTAMP_RE} ", line) for line in log_lines)
+    log_text = "\n".join(log_lines)
+    assert "ordinary subprocess output" in log_text
+    assert "Generation progress: repo.api/abcdef1 test 1/2 accepted" in log_text
+
+
+def test_run_command_timestamps_verbose_terminal_output(tmp_path, capsys):
+    log_path = tmp_path / "commits.log"
+
+    return_code, _ = run_command(
+        [sys.executable, "-c", "print('stage output')"],
+        log_path,
+        "repo",
+        verbose=True,
+    )
+
+    assert return_code == 0
+    assert re.fullmatch(
+        rf"{TIMESTAMP_RE} \[repo\] stage output\n",
+        capsys.readouterr().out,
+    )
+    assert all(
+        re.match(rf"{TIMESTAMP_RE} ", line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+    )
