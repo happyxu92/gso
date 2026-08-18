@@ -230,8 +230,8 @@ def configure_openai_compatible_llm(
         raise ValueError("llm.multiprocess must be at least 1")
 
     max_tokens = None
-    if default_max_tokens is not None:
-        raw_max_tokens = llm_config.get("max_tokens", default_max_tokens)
+    raw_max_tokens = llm_config.get("max_tokens", default_max_tokens)
+    if raw_max_tokens is not None:
         if isinstance(raw_max_tokens, bool):
             raise ValueError("llm.max_tokens must be a positive integer")
         if isinstance(raw_max_tokens, int):
@@ -244,8 +244,8 @@ def configure_openai_compatible_llm(
             raise ValueError("llm.max_tokens must be at least 1")
 
     openai_timeout = None
-    if default_openai_timeout is not None:
-        raw_openai_timeout = llm_config.get("openai_timeout", default_openai_timeout)
+    raw_openai_timeout = llm_config.get("openai_timeout", default_openai_timeout)
+    if raw_openai_timeout is not None:
         if isinstance(raw_openai_timeout, bool):
             raise ValueError("llm.openai_timeout must be a positive integer")
         if isinstance(raw_openai_timeout, int):

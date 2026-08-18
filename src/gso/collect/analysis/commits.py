@@ -17,7 +17,10 @@ from gso.collect.analysis.prompt import *
 from gso.collect.analysis.utils import *
 from gso.constants import *
 from gso.utils.io import *
-from gso.utils.llm import configure_openai_compatible_llm
+from gso.utils.llm import (
+    configure_openai_compatible_llm,
+    get_streaming_llm_completions,
+)
 
 if TYPE_CHECKING:
     from gso.collect.analysis.retriever import Retriever
@@ -39,6 +42,8 @@ DEFAULT_LLM_CACHE_SETTINGS = {
 class PerfCommitAnalyzer:
     model_name = DEFAULT_ANALYSIS_MODEL
     llm_multiprocess = DEFAULT_LLM_MULTIPROCESS
+    llm_max_tokens: int | None = None
+    llm_openai_timeout: int | None = None
     llm_cache_settings = DEFAULT_LLM_CACHE_SETTINGS.copy()
 
     @classmethod
@@ -74,10 +79,32 @@ class PerfCommitAnalyzer:
         )
         cls.model_name = configured.model_name
         cls.llm_multiprocess = configured.multiprocess
+        cls.llm_max_tokens = configured.max_tokens
+        cls.llm_openai_timeout = configured.openai_timeout
         cls.llm_cache_settings = {
             stage: cache_config.get(stage, default)
             for stage, default in DEFAULT_LLM_CACHE_SETTINGS.items()
         }
+
+    @classmethod
+    def build_llm_args(cls, *, cache_stage: str, default_max_tokens: int):
+        """Build analysis request arguments with experiment-wide LLM overrides."""
+        from r2e.llms.llm_args import LLMArgs
+
+        kwargs = {
+            "model_name": cls.model_name,
+            "cache_batch_size": 100,
+            "multiprocess": cls.llm_multiprocess,
+            "use_cache": cls.llm_cache_settings[cache_stage],
+            "max_tokens": (
+                cls.llm_max_tokens
+                if cls.llm_max_tokens is not None
+                else default_max_tokens
+            ),
+        }
+        if cls.llm_openai_timeout is not None:
+            kwargs["openai_timeout"] = cls.llm_openai_timeout
+        return LLMArgs(**kwargs)
 
     @staticmethod
     def parse_diff_for_stats(
@@ -279,20 +306,13 @@ class PerfCommitAnalyzer:
     def llm_analysis(
         commits: list[PerformanceCommit], repo_path: Path, verbose: bool = False
     ):
-        from r2e.llms.completions import LLMCompletions
-        from r2e.llms.llm_args import LLMArgs
-
         prompts = [PerfCommitAnalyzer.analysis_prompt(commit) for commit in commits]
 
-        args = LLMArgs(
-            model_name=PerfCommitAnalyzer.model_name,
-            cache_batch_size=100,
-            multiprocess=PerfCommitAnalyzer.llm_multiprocess,
-            use_cache=PerfCommitAnalyzer.llm_cache_settings["commit_filter"],
-            max_tokens=10000,
-        )  # type: ignore
+        args = PerfCommitAnalyzer.build_llm_args(
+            cache_stage="commit_filter", default_max_tokens=10000
+        )
 
-        responses = LLMCompletions.get_llm_completions(args, prompts)
+        responses = get_streaming_llm_completions(args, prompts)
 
         filtered = []
         for commit, completions in zip(commits, responses):
@@ -326,17 +346,12 @@ class PerfCommitAnalyzer:
 
     @staticmethod
     def retrieve_affected_files(commits: list[PerformanceCommit], repo_path: Path):
-        from r2e.llms.llm_args import LLMArgs
         from gso.collect.analysis.retriever import Retriever
 
         retriever = Retriever(repo_path)
-        llm_args = LLMArgs(
-            model_name=PerfCommitAnalyzer.model_name,
-            cache_batch_size=100,
-            multiprocess=PerfCommitAnalyzer.llm_multiprocess,
-            use_cache=PerfCommitAnalyzer.llm_cache_settings["affected_files"],
-            max_tokens=24000,
-        )  # type: ignore
+        llm_args = PerfCommitAnalyzer.build_llm_args(
+            cache_stage="affected_files", default_max_tokens=24000
+        )
         retriever.retrieve_affected_files(commits, llm_args)
         return retriever
 
@@ -384,9 +399,6 @@ class PerfCommitAnalyzer:
 
     @staticmethod
     def llm_get_apis(commits: list[PerformanceCommit], retriever: Retriever):
-        from r2e.llms.completions import LLMCompletions
-        from r2e.llms.llm_args import LLMArgs
-
         if SKIP_API_ANALYSIS:
             for commit in commits:
                 commit.add_apis(["SkippedAPIAnalysis"])
@@ -400,15 +412,11 @@ class PerfCommitAnalyzer:
             for commit in commits
         ]
 
-        args = LLMArgs(
-            model_name=PerfCommitAnalyzer.model_name,
-            cache_batch_size=100,
-            multiprocess=PerfCommitAnalyzer.llm_multiprocess,
-            use_cache=PerfCommitAnalyzer.llm_cache_settings["api_identification"],
-            max_tokens=24000,
-        )  # type: ignore
+        args = PerfCommitAnalyzer.build_llm_args(
+            cache_stage="api_identification", default_max_tokens=24000
+        )
 
-        responses = LLMCompletions.get_llm_completions(args, prompts)
+        responses = get_streaming_llm_completions(args, prompts)
 
         for commit, completions in zip(commits, responses):
             try:
@@ -418,9 +426,7 @@ class PerfCommitAnalyzer:
                 apis: list[str] = []
                 obj = PerfCommitAnalyzer.parse_json_dict(completions[0])
                 if obj is not None:
-                    reasoning = str(
-                        obj.get("reason", obj.get("reasoning", ""))
-                    ).strip()
+                    reasoning = str(obj.get("reason", obj.get("reasoning", ""))).strip()
                     apis_raw = obj.get("apis", [])
                     if isinstance(apis_raw, str):
                         apis = [a.strip() for a in apis_raw.split(",") if a.strip()]

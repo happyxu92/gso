@@ -5,8 +5,8 @@ from collections import deque
 
 from gso.data import PerformanceCommit
 from r2e.llms.llm_args import LLMArgs
-from r2e.llms.completions import LLMCompletions
 from gso.collect.analysis.utils import *
+from gso.utils.llm import get_streaming_llm_completions
 
 MAX_COMMIT_TOKENS = 30000
 IGNORE_DIRECTORY_SIZE = 500
@@ -169,9 +169,11 @@ class Retriever:
             {"role": "user", "content": user_prompt},
         ]
 
-    def retrieve_affected_files(self, commits, llm_args) -> None:
+    def retrieve_affected_files(
+        self, commits: list[PerformanceCommit], llm_args: LLMArgs
+    ) -> None:
         prompts = [self.build_prompt(commit) for commit in commits]
-        responses = LLMCompletions.get_llm_completions(llm_args, prompts)
+        responses = get_streaming_llm_completions(llm_args, prompts)
 
         for commit, completions in zip(commits, responses):
             if not completions or not isinstance(completions[0], str):
