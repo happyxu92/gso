@@ -35,6 +35,8 @@ Common options::
     --max-year 2022           commit year cutoff (analysis + generation)
     -n 5                      target tests per commit
     --api pkg.api             restrict generate/execute/evaluate to one API
+    --api-key-envs KEY_1,KEY_2
+                              rotate API key environment names across YAMLs
     --only repo1,repo2        restrict the repo list to these names
     --dry-run                 print planned commands without executing
 """
@@ -45,6 +47,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -94,6 +97,12 @@ STAGE_LOG_NAMES = {
 }
 
 _PRINT_LOCK = threading.Lock()
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_API_KEY_ENV_LINE_RE = re.compile(
+    r"^(?P<prefix>[ \t]*api_key_env[ \t]*:[ \t]*)"
+    r"[^#\r\n]*?(?P<comment>[ \t]+#.*)?$",
+    re.MULTILINE,
+)
 
 
 def log(msg: str) -> None:
@@ -181,6 +190,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--api", default=None, help="restrict generate/execute/evaluate to one API"
+    )
+    p.add_argument(
+        "--api-key-env",
+        "--api-key-envs",
+        dest="api_key_envs",
+        action="append",
+        default=[],
+        metavar="ENV[,ENV...]",
+        help=(
+            "API key environment variable names to rotate across generated YAML "
+            "configs; comma-separated and/or repeatable (keys stay out of YAML)"
+        ),
     )
     p.add_argument(
         "--base-image",
@@ -300,12 +321,62 @@ def read_repo_list(path: Path) -> list[tuple[str, str]]:
     return rows
 
 
-def render_config(template_text: str, exp_id: str, url: str) -> str:
+def normalize_api_key_envs(raw_values: list[str] | None) -> list[str]:
+    """Parse and validate repeatable/comma-separated environment names."""
+    names: list[str] = []
+    for raw_value in raw_values or []:
+        for raw_name in raw_value.split(","):
+            name = raw_name.strip()
+            if not name:
+                raise SystemExit("--api-key-envs contains an empty environment name")
+            if not _ENV_VAR_NAME_RE.fullmatch(name):
+                raise SystemExit(f"invalid API key environment variable name: {name!r}")
+            if name in names:
+                raise SystemExit(f"duplicate API key environment variable name: {name}")
+            names.append(name)
+    return names
+
+
+def set_config_api_key_env(config_text: str, api_key_env: str) -> str:
+    """Set the sole api_key_env entry while preserving the rest of the YAML."""
+    matches = list(_API_KEY_ENV_LINE_RE.finditer(config_text))
+    if len(matches) != 1:
+        raise ValueError(
+            "experiment YAML must contain exactly one 'api_key_env:' entry "
+            f"when --api-key-envs is used (found {len(matches)})"
+        )
+
+    def replacement(match: re.Match[str]) -> str:
+        comment = match.group("comment") or ""
+        return f'{match.group("prefix")}{json.dumps(api_key_env)}{comment}'
+
+    return _API_KEY_ENV_LINE_RE.sub(replacement, config_text, count=1)
+
+
+def render_config(
+    template_text: str,
+    exp_id: str,
+    url: str,
+    api_key_env: str | None = None,
+) -> str:
     text = template_text
     text = text.replace("REPLACE_EXP_ID", exp_id)
     text = text.replace("https://github.com/REPLACE_OWNER/REPLACE_REPOSITORY", url)
+    if api_key_env is not None:
+        text = set_config_api_key_env(text, api_key_env)
     # Backstop: if the template uses bare owner/repo placeholders elsewhere.
     return text
+
+
+def assign_api_key_envs(
+    rows: list[tuple[str, str]], api_key_envs: list[str]
+) -> list[tuple[tuple[str, str], str | None]]:
+    """Assign environment names round-robin in the input repository order."""
+    if not api_key_envs:
+        return [(row, None) for row in rows]
+    return [
+        (row, api_key_envs[index % len(api_key_envs)]) for index, row in enumerate(rows)
+    ]
 
 
 def resolve_stages(stages_arg: str) -> set[str]:
@@ -396,6 +467,7 @@ def prepare_workspace(
     template_text: str,
     overwrite_config: bool,
     dry_run: bool,
+    api_key_env: str | None = None,
 ) -> Path:
     if not dry_run:
         workspace.mkdir(parents=True, exist_ok=True)
@@ -406,9 +478,18 @@ def prepare_workspace(
         return config_path
     existed = config_path.exists()
     if existed and not overwrite_config:
-        log(f"[{repo}] reuse existing config: {config_path}")
+        if api_key_env is None:
+            log(f"[{repo}] reuse existing config: {config_path}")
+        else:
+            existing_text = config_path.read_text(encoding="utf-8")
+            updated = set_config_api_key_env(existing_text, api_key_env)
+            config_path.write_text(updated, encoding="utf-8")
+            log(
+                f"[{repo}] updated api_key_env={api_key_env} in existing config: "
+                f"{config_path}"
+            )
     else:
-        rendered = render_config(template_text, repo, url)
+        rendered = render_config(template_text, repo, url, api_key_env)
         config_path.write_text(rendered, encoding="utf-8")
         action = "overwrote" if existed else "wrote"
         log(f"[{repo}] {action} config: {config_path}")
@@ -626,6 +707,7 @@ def stage_prerequisites(repo: str, exp_id: str, paths: BucketPaths) -> dict:
 # ---------------------------------------------------------------------------
 def run_repo(
     repo_row: tuple[str, str],
+    api_key_env: str | None,
     args: argparse.Namespace,
     paths: BucketPaths,
     template_text: str,
@@ -641,6 +723,8 @@ def run_repo(
     started = time.time()
 
     try:
+        if api_key_env is not None:
+            log(f"[{repo}] assigned api_key_env={api_key_env}")
         config_path = prepare_workspace(
             repo,
             url,
@@ -651,6 +735,7 @@ def run_repo(
             template_text,
             args.overwrite_config,
             args.dry_run,
+            api_key_env,
         )
         repo_checkout = paths.analysis_repos / repo
         stages = build_stages(
@@ -806,20 +891,26 @@ def preflight(args: argparse.Namespace) -> None:
     env_path = _load_dotenv_parent()
     if env_path:
         log(f"loaded .env from {env_path}")
-    # Check likely LLM key names without printing values.
-    key_candidates = [
+    # Check LLM key names without printing values.
+    key_candidates = args.api_key_envs or [
         "LLM_API_KEY",
         "OPENAI_API_KEY",
         "OPENAI_KEY",
-        "GHAPI_TOKEN",
     ]
     present = [name for name in key_candidates if os.getenv(name)]
+    missing = [name for name in key_candidates if not os.getenv(name)]
     if present:
         log(f"credentials present in env: {', '.join(present)}")
+        if args.api_key_envs and missing:
+            log(
+                "WARNING: configured API key environment variable(s) not set: "
+                + ", ".join(missing)
+            )
     else:
         log(
-            "WARNING: none of LLM_API_KEY/OPENAI_API_KEY/GHAPI_TOKEN found in "
-            "env; put them in a .env (or export them) before analysis/generation."
+            "WARNING: none of the API key environment variables are set: "
+            + ", ".join(key_candidates)
+            + "; put them in a .env (or export them) before analysis/generation."
         )
 
 
@@ -865,6 +956,7 @@ def print_summary(results: list[RepoResult]) -> None:
 # ---------------------------------------------------------------------------
 def main(argv=None) -> int:
     args = parse_args(argv)
+    args.api_key_envs = normalize_api_key_envs(args.api_key_envs)
 
     args.buckets_dir = args.buckets_dir.expanduser().resolve()
     args.experiments_root = args.experiments_root.expanduser().resolve()
@@ -896,14 +988,25 @@ def main(argv=None) -> int:
     log(f"bucket: {paths.gso_bucket}")
     log(f"workspaces: {args.experiments_root}/<repo>/{{logs,plots}}")
     log(f"interpreter: {args.python}")
+    if args.api_key_envs:
+        log("API key env rotation: " + " -> ".join(args.api_key_envs))
     if not args.dry_run:
         preflight(args)
 
     results: list[RepoResult] = []
+    assignments = assign_api_key_envs(rows, args.api_key_envs)
     with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
         futures = {
-            pool.submit(run_repo, row, args, paths, template_text, selected): row
-            for row in rows
+            pool.submit(
+                run_repo,
+                row,
+                api_key_env,
+                args,
+                paths,
+                template_text,
+                selected,
+            ): row
+            for row, api_key_env in assignments
         }
         for future in as_completed(futures):
             row = futures[future]

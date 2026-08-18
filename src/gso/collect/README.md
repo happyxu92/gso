@@ -191,6 +191,22 @@ the exact commands with `--dry-run`. See `--help` for the full option list.
 Run with the GSO virtualenv interpreter (`.venv/bin/python`) so the spawned
 GSO subprocesses can `import gso`.
 
+To distribute repositories across multiple LLM credentials, store each key in
+its own environment variable and pass the variable names with
+`--api-key-envs`. The runner assigns them round-robin in the filtered CSV order
+and writes only the environment variable name to each YAML (never the key):
+
+```bash
+.venv/bin/python src/gso/collect/run_pipeline.py assets/gso-python-performance-repositories \
+  --api-key-envs LLM_API_KEY_1,LLM_API_KEY_2,LLM_API_KEY_3
+```
+
+For example, repositories 1 and 4 use `LLM_API_KEY_1`. The option is also
+repeatable (`--api-key-env LLM_API_KEY_1 --api-key-env LLM_API_KEY_2`). When a
+config already exists, only its `llm.api_key_env` entry is updated; use
+`--overwrite-config` separately when the entire template should be rendered
+again.
+
 When a stage is selected on its own (its producer stage is not in `--stages`),
 the runner reuses the producer's artifact from the bucket. If that artifact is
 missing — for example `generate` without a prior `analysis/apis/{repo}_ac_map.json`
