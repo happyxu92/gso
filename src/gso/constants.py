@@ -8,7 +8,14 @@ current_dir = Path(__file__).parent
 # --------- Path Constants ---------
 
 HOME_DIR = Path(os.path.expanduser("~"))
-GSO_BUCKET_DIR = HOME_DIR / "buckets" / "gso_bucket"
+# Allow operators to relocate the GSO bucket (for parallel runners or a shared
+# scratch volume). Defaults to ~/buckets/gso_bucket for backward compatibility.
+_gso_bucket_env = os.environ.get("GSO_BUCKET_DIR")
+GSO_BUCKET_DIR = (
+    Path(_gso_bucket_env).expanduser()
+    if _gso_bucket_env
+    else HOME_DIR / "buckets" / "gso_bucket"
+)
 
 ANALYSIS_DIR = GSO_BUCKET_DIR / "analysis"
 ANALYSIS_REPOS_DIR = ANALYSIS_DIR / "repos"

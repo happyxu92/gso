@@ -155,3 +155,49 @@ python src/gso/collect/execute/evaluate.py \
   --exp_id numpy \
   --api numpy.add
 ```
+
+### 5. Bulk pipeline across many repositories
+
+`run_pipeline.py` orchestrates the full collection workflow (commit analysis →
+API mapping → test generation → execution → evaluation) for every repository in
+a CSV list, running several repositories concurrently. Each repository gets its
+own workspace under `experiments/{repo}/` (an auto-generated `experiment.yaml`,
+run logs under `logs/`, and evaluation plots under `plots/`), while GSO-generated
+artifacts remain in the configurable GSO bucket (`~/buckets/gso_bucket` by
+default).
+
+```bash
+.venv/bin/python src/gso/collect/run_pipeline.py \
+  assets/gso-python-performance-repositories \
+  -j 3 --max-year 2022 -n 5
+```
+
+The config is rendered from the [experiment template](/.agents/skills/build-gso-docker-task/assets/experiment.yaml)
+with `exp_id`/`repo_url` filled in; existing configs are reused unless
+`--overwrite-config` is passed. Stage selection (`--stages`) lets you run pieces
+independently — for example analysis only, or generation on its own (which
+transparently reuses the `analysis/commits` and `analysis/apis` artifacts
+already produced in the bucket):
+```bash
+.venv/bin/python src/gso/collect/run_pipeline.py assets/gso-python-performance-repositories \
+  --only numpy,markitdown --stages commits,apis
+.venv/bin/python src/gso/collect/run_pipeline.py assets/gso-python-performance-repositories \
+  --only numpy,markitdown --stages generate,execute,evaluate
+```
+
+Relocate the GSO bucket with `--buckets-dir` (or `GSO_BUCKET_DIR`), restrict to
+a few repositories with `--only`, restrict to one API with `--api`, and preview
+the exact commands with `--dry-run`. See `--help` for the full option list.
+Run with the GSO virtualenv interpreter (`.venv/bin/python`) so the spawned
+GSO subprocesses can `import gso`.
+
+When a stage is selected on its own (its producer stage is not in `--stages`),
+the runner reuses the producer's artifact from the bucket. If that artifact is
+missing — for example `generate` without a prior `analysis/apis/{repo}_ac_map.json`
+or `execute` without `experiments/{exp_id}/{exp_id}_problems.json` — the stage is
+skipped with a clear warning and a hint (`run --stages ... first`) instead of
+letting `generate.py`/`execute.py` crash with a `FileNotFoundError`. Downstream
+stages are skipped transitively, so a skipped `generate` also skips `execute`
+and `evaluate`. A skipped repo counts as `SKIP(...)` in the summary (exit code 0),
+not a failure; a repo whose selected stage actually ran and exited non-zero is
+reported as `FAIL@<stage>` (exit code 1).
