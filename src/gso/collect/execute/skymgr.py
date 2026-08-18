@@ -27,7 +27,9 @@ class SkyManager:
             return Template(f.read())
 
     @staticmethod
-    def build_templates(temp_dir, task, phase1, phase2, problem):
+    def build_templates(
+        temp_dir, task, phase1, phase2, problem, phase1_only: bool = False
+    ):
         setup_commands = "\n  ".join(problem.setup_commands)
         install_commands = add_tokens_to_installs(problem.install_commands)
         install_commands = "\n        ".join(install_commands)
@@ -42,6 +44,7 @@ class SkyManager:
             repo_url=problem.repo.repo_url,
             repo_name=problem.repo.repo_name,
             candidates=candidates,
+            run_phase2="" if phase1_only else "./phase2.sh",
         )
 
         phase1 = phase1.safe_substitute(
@@ -67,7 +70,7 @@ class SkyManager:
             phase2_file.write(phase2)
 
     @staticmethod
-    def create_workspace(problem) -> Path:
+    def create_workspace(problem, phase1_only: bool = False) -> Path:
         task = SkyManager.load_template(SKYGEN_TEMPLATE)
         phase1 = SkyManager.load_template(PHASE1_TEMPLATE)
         phase2 = SkyManager.load_template(PHASE2_TEMPLATE)
@@ -76,7 +79,9 @@ class SkyManager:
             temp_dir = Path(temp_dir)
 
             # Create and write tamplates (task, phase1, phase2) to workspace
-            SkyManager.build_templates(temp_dir, task, phase1, phase2, problem)
+            SkyManager.build_templates(
+                temp_dir, task, phase1, phase2, problem, phase1_only=phase1_only
+            )
 
             # each candidate commit is a subdirectory in the workspace
             for commit_tests in problem.tests:

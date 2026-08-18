@@ -21,4 +21,4 @@ run: |
   chmod +x phase2.sh
 
   ./phase1.sh
-  ./phase2.sh
+  $run_phase2

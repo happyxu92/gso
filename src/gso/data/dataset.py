@@ -42,9 +42,13 @@ class GSOInstance:
 
         # Pin setuptools<82 in build isolation to preserve pkg_resources
         # for legacy setup.py projects (setuptools 82+ removed pkg_resources)
+        # Raise uv's download timeout: the remote build2acr builder fetches
+        # from PyPI slowly, and large wheels (e.g. pyarrow) exceed the 30s
+        # default and abort the whole image build.
         build_constraint_setup = [
             "echo 'setuptools<82' > /tmp/uv_build_constraints.txt",
             "export UV_BUILD_CONSTRAINT=/tmp/uv_build_constraints.txt",
+            "export UV_HTTP_TIMEOUT=600",
         ]
 
         repo_setup = [

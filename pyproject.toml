@@ -40,3 +40,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gso"]
+
+[tool.hatch.metadata]
+# Dependency #27 (`r2e @ git+https://...`) is a direct (URL) reference.
+# hatchling refuses direct references in `project.dependencies` unless this
+# flag is set, which breaks `uv sync --frozen` during the base image build.
+allow-direct-references = true

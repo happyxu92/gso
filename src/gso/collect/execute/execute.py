@@ -52,6 +52,7 @@ class GeneratedTestExecutionConfig:
     keep_containers: bool = False
     keep_workspaces: bool = False
     poll_interval: float | None = None
+    phase1_only: bool = True
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class ExecutionManager:
         interactive: bool = False,
         poll_interval: float = 5,
         keep_workspaces: bool = False,
+        phase1_only: bool = False,
     ):
         if machines < 1:
             raise ValueError("machines must be at least 1")
@@ -96,6 +98,7 @@ class ExecutionManager:
         self.interactive = interactive
         self.poll_interval = poll_interval
         self.keep_workspaces = keep_workspaces
+        self.phase1_only = phase1_only
 
         self.cluster_counter = 0
         self.execution_id = uuid.uuid4().hex[:8]
@@ -125,7 +128,11 @@ class ExecutionManager:
             for run_idx in range(self.runs):
                 cluster = self.get_next_cluster_name()
                 try:
-                    workspace = Path(self.runtime.create_workspace(problem))
+                    workspace = Path(
+                        self.runtime.create_workspace(
+                            problem, phase1_only=self.phase1_only
+                        )
+                    )
                 except Exception as exc:
                     errors.append(f"{problem.pid} run {run_idx + 1}: {exc}")
                     continue
@@ -276,7 +283,7 @@ class ExecutionManager:
                 if exit_code not in (None, 0):
                     state.failed = True
                     state.error = f"task exited with code {exit_code}"
-                elif not results:
+                elif not results and not self.phase1_only:
                     state.failed = True
                     state.error = "task produced no usable result files"
 
@@ -490,7 +497,13 @@ async def _async_evaluate_generated_test(
     generated_test: str,
     config: GeneratedTestExecutionConfig,
 ) -> GeneratedTestExecutionResult:
-    """Execute one generated test against a commit parent and candidate."""
+    """Run one generated test once on the commit's parent (base) commit.
+
+    Phase 1 only: a zero container exit means phase1.sh found a working
+    commit-test pair, i.e. the generated test executed successfully on the
+    base commit. That alone qualifies the test as runnable; phase 2 outcome
+    and result files are not used in this validation mode.
+    """
     try:
         validation_problem = problem.model_copy(deep=True)
         validation_problem.commits = [commit]
@@ -533,6 +546,7 @@ async def _async_evaluate_generated_test(
         results_path=results_path,
         poll_interval=effective_poll_interval,
         keep_workspaces=config.keep_workspaces,
+        phase1_only=config.phase1_only,
     )
     manager_error = None
     try:
@@ -546,20 +560,16 @@ async def _async_evaluate_generated_test(
             except Exception:
                 pass
 
-    collected_results = [
-        result
-        for run_results in validation_problem.results.values()
-        for result in run_results
-    ]
-    passed = any(
-        result.get("commit") in {commit.commit_hash, commit.quick_hash()}
-        and "base_result" in result
-        and "commit_result" in result
-        and result.get("base_result") is not None
-        and result.get("commit_result") is not None
-        for result in collected_results
+    # Phase 1-only validation: the container runs phase1.sh exclusively, which
+    # exits 0 iff the generated test executed successfully on the base (parent)
+    # commit and produced a working pair. A clean exit is sufficient to accept
+    # the test as runnable; phase 2 result files are not produced in this mode.
+    passed = (
+        manager_error is None
+        and bool(manager.tasks)
+        and all(not state.failed for state in manager.tasks.values())
     )
-    if passed and manager_error is None:
+    if passed:
         return GeneratedTestExecutionResult(passed=True)
 
     error, log_path = _execution_error_detail(manager, runtime, manager_error)
