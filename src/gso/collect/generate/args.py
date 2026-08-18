@@ -1,3 +1,5 @@
+from typing import Any
+
 from r2e.llms.llm_args import LLMArgs
 from pydantic import Field
 
@@ -33,6 +35,14 @@ class PerfExpGenArgs(LLMArgs):
         DEFAULT_GENERATION_OPENAI_TIMEOUT,
         ge=1,
         description="Timeout in seconds for each OpenAI-compatible API request.",
+    )
+    stream: bool = Field(
+        False,
+        description="Use streaming OpenAI-compatible responses.",
+    )
+    extra_body: dict[str, Any] | None = Field(
+        None,
+        description="Additional JSON fields for OpenAI-compatible requests.",
     )
     api: str | None = Field(None, description="API to generate tests for.")
     docker_image: str | None = Field(

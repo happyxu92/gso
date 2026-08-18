@@ -27,7 +27,7 @@ from gso.collect.execute.execute import (
 from gso.utils.io import *
 from gso.utils.llm import (
     configure_openai_compatible_llm,
-    get_streaming_llm_completion,
+    get_llm_completion,
 )
 from gso.collect.generate.prompt import *
 from gso.collect.generate.helpers import *
@@ -254,8 +254,10 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                 raw_output = None
                 try:
                     try:
-                        raw_output = get_streaming_llm_completion(
-                            request_args, attempt_payload
+                        raw_output = get_llm_completion(
+                            request_args,
+                            attempt_payload,
+                            stream=request_args.stream,
                         )
                     except Exception as completion_exception:
                         raise GeneratedTestError(
@@ -461,6 +463,10 @@ class PerfExpGenerator:
             effective_llm_config["max_tokens"] = args.max_tokens
         if "openai_timeout" in explicit_fields:
             effective_llm_config["openai_timeout"] = args.openai_timeout
+        if "stream" in explicit_fields:
+            effective_llm_config["stream"] = args.stream
+        if "extra_body" in explicit_fields:
+            effective_llm_config["extra_body"] = args.extra_body
 
         configured = configure_openai_compatible_llm(
             {"llm": effective_llm_config},
@@ -477,6 +483,8 @@ class PerfExpGenerator:
             args.max_tokens = configured.max_tokens
         if configured.openai_timeout is not None:
             args.openai_timeout = configured.openai_timeout
+        args.stream = configured.stream
+        args.extra_body = configured.extra_body
 
     def get_commit_map(self, repo: Repo):
         """Get the api-commit map for the repository"""
@@ -609,7 +617,7 @@ class PerfExpGenerator:
             f"Generating {len(problems)} problems across {len(commit_tasks)} commits "
             f"(tests_per_commit={args.n}, choices_per_request=1, "
             f"commit_workers={commit_workers}, max_tokens={args.max_tokens}, "
-            "stream=True)"
+            f"stream={args.stream})"
         )
         generation_outputs = run_tasks_in_parallel(
             generate_commit_tests,

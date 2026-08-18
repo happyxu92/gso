@@ -21,20 +21,31 @@ class ConfiguredLLM:
     base_url: str | None
     max_tokens: int | None = None
     openai_timeout: int | None = None
+    stream: bool = False
+    extra_body: dict[str, Any] | None = None
 
 
 class IncompleteStreamingResponse(RuntimeError):
-    """Raised when a stream does not produce every requested text completion."""
+    """Raised when an LLM response does not contain every requested completion."""
 
 
 class StreamingOpenAIRunner(BaseRunner):
-    """R2E-compatible OpenAI runner that aggregates streamed completion chunks."""
+    """R2E-compatible OpenAI runner supporting bounded stream/non-stream calls."""
 
     client: ClassVar[OpenAI | None] = None
     retry_delay_seconds = 30
+    max_retries = 5
 
-    def __init__(self, args, model: LanguageModel):
+    def __init__(
+        self,
+        args,
+        model: LanguageModel,
+        *,
+        stream: bool = False,
+        extra_body: dict[str, Any] | None = None,
+    ):
         super().__init__(args, model)
+        self.stream = stream
         if any(name in args.model_name for name in ("o1", "o3", "o4")):
             self.client_kwargs: dict[str, Any] = {
                 "model": args.model_name,
@@ -51,10 +62,12 @@ class StreamingOpenAIRunner(BaseRunner):
                 "n": 1,
                 "timeout": args.openai_timeout,
             }
+        if extra_body is not None:
+            self.client_kwargs["extra_body"] = extra_body
 
     def config(self) -> dict[str, Any]:
         # Include the transport mode in R2E's cache key.
-        return {**self.client_kwargs, "stream": True}
+        return {**self.client_kwargs, "stream": self.stream}
 
     def _get_client(self) -> OpenAI:
         if StreamingOpenAIRunner.client is None:
@@ -115,14 +128,32 @@ class StreamingOpenAIRunner(BaseRunner):
             )
         return outputs
 
+    def _consume_non_stream(self, payload: list[dict[str, str]]) -> list[str]:
+        response = self._get_client().chat.completions.create(
+            messages=payload,
+            stream=False,
+            **self.client_kwargs,
+        )
+        outputs = [choice.message.content or "" for choice in response.choices]
+        if not outputs or any(not output.strip() for output in outputs):
+            raise IncompleteStreamingResponse(
+                "non-stream response ended without content"
+            )
+        return outputs
+
     def _run_single(self, payload: list[dict[str, str]]) -> list[str]:
         assert isinstance(payload, list)
 
-        while True:
+        for retry_number in range(self.max_retries + 1):
             try:
-                return self._consume_stream(payload)
+                if self.stream:
+                    return self._consume_stream(payload)
+                return self._consume_non_stream(payload)
             except (
-                openai.OpenAIError,
+                openai.APIConnectionError,
+                openai.APITimeoutError,
+                openai.RateLimitError,
+                openai.InternalServerError,
                 httpx.TransportError,
                 IncompleteStreamingResponse,
             ) as error:
@@ -130,8 +161,15 @@ class StreamingOpenAIRunner(BaseRunner):
                 cause = error.__cause__ or error.__context__
                 if cause is not None:
                     print("Caused by: ", repr(cause), flush=True)
+                if retry_number == self.max_retries:
+                    print(
+                        f"LLM request failed after {self.max_retries} retries.",
+                        flush=True,
+                    )
+                    raise
                 print(
-                    f"Sleeping for {self.retry_delay_seconds} seconds...",
+                    f"Retrying LLM request {retry_number + 1}/"
+                    f"{self.max_retries} after {self.retry_delay_seconds} seconds...",
                     flush=True,
                 )
                 print(
@@ -139,6 +177,8 @@ class StreamingOpenAIRunner(BaseRunner):
                     flush=True,
                 )
                 sleep(self.retry_delay_seconds)
+
+        raise AssertionError("unreachable")
 
 
 def _get_openai_model(model_name: str) -> LanguageModel:
@@ -161,20 +201,45 @@ def _get_openai_model(model_name: str) -> LanguageModel:
     return matched_models[0]
 
 
-def get_streaming_llm_completions(args, payloads: list) -> list[list[str]]:
-    """Generate one streamed choice for each OpenAI-compatible payload."""
-    request_args = args.model_copy(update={"n": 1})
+def get_llm_completions(
+    args,
+    payloads: list,
+    *,
+    stream: bool = False,
+    extra_body: dict[str, Any] | None = None,
+) -> list[list[str]]:
+    """Generate OpenAI-compatible completions using the selected transport."""
+    request_args = args.model_copy(update={"n": 1}) if stream else args
     model = _get_openai_model(request_args.model_name)
     if model.style != LanguageModelStyle.OpenAI:
-        raise ValueError(f"Streaming is unsupported for model style: {model.style}")
+        raise ValueError(f"Unsupported model style: {model.style}")
 
-    return StreamingOpenAIRunner(request_args, model).run_main(payloads)
+    if extra_body is None:
+        extra_body = getattr(request_args, "extra_body", None)
+    return StreamingOpenAIRunner(
+        request_args,
+        model,
+        stream=stream,
+        extra_body=extra_body,
+    ).run_main(payloads)
+
+
+def get_streaming_llm_completions(args, payloads: list) -> list[list[str]]:
+    """Backward-compatible wrapper for streamed OpenAI-compatible completions."""
+    return get_llm_completions(args, payloads, stream=True)
 
 
 def get_streaming_llm_completion(args, payload: list[dict[str, str]]) -> str:
     """Generate exactly one choice without introducing payload-level concurrency."""
+    return get_llm_completion(args, payload, stream=True)
+
+
+def get_llm_completion(
+    args, payload: list[dict[str, str]], *, stream: bool = False
+) -> str:
+    """Generate one choice without introducing payload-level concurrency."""
     request_args = args.model_copy(update={"n": 1, "multiprocess": 1})
-    outputs = get_streaming_llm_completions(request_args, [payload])
+    outputs = get_llm_completions(request_args, [payload], stream=stream)
     if len(outputs) != 1 or len(outputs[0]) != 1:
         choice_counts = [len(group) for group in outputs]
         raise IncompleteStreamingResponse(
@@ -259,6 +324,16 @@ def configure_openai_compatible_llm(
         if openai_timeout < 1:
             raise ValueError("llm.openai_timeout must be at least 1")
 
+    stream = llm_config.get("stream", False)
+    if not isinstance(stream, bool):
+        raise ValueError("llm.stream must be a boolean")
+
+    extra_body = llm_config.get("extra_body")
+    if extra_body is not None:
+        if not isinstance(extra_body, dict):
+            raise ValueError("llm.extra_body must be a YAML mapping")
+        extra_body = dict(extra_body)
+
     model_name = model_name.strip()
     base_url = str(base_url).rstrip("/") if base_url else None
 
@@ -294,6 +369,9 @@ def configure_openai_compatible_llm(
         settings.append(f"max_tokens={max_tokens}")
     if openai_timeout is not None:
         settings.append(f"openai_timeout={openai_timeout}s")
+    settings.append(f"stream={str(stream).lower()}")
+    if extra_body is not None:
+        settings.append("extra_body=configured")
     settings_info = f" with {', '.join(settings)}" if settings else ""
     print(f"Using {purpose} model '{model_name}' via {endpoint}{settings_info}")
     return ConfiguredLLM(
@@ -302,4 +380,6 @@ def configure_openai_compatible_llm(
         base_url=base_url,
         max_tokens=max_tokens,
         openai_timeout=openai_timeout,
+        stream=stream,
+        extra_body=extra_body,
     )

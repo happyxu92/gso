@@ -166,6 +166,88 @@ def test_streaming_runner_uses_one_choice_even_when_test_count_is_larger():
     assert runner.client_kwargs["n"] == 1
 
 
+def test_runner_applies_configured_extra_body_for_stream_and_non_stream():
+    args = LLMArgs(model_name="custom-model", n=1, use_cache=False)
+    model = LanguageModel(
+        model_name=args.model_name,
+        style=LanguageModelStyle.OpenAI,
+    )
+
+    for stream in (False, True):
+        runner = llm_utils.StreamingOpenAIRunner(
+            args,
+            model,
+            stream=stream,
+            extra_body={"enable_thinking": False},
+        )
+        assert runner.client_kwargs["extra_body"] == {"enable_thinking": False}
+
+
+def test_runner_omits_extra_body_when_not_configured():
+    args = LLMArgs(model_name="custom-model", n=1, use_cache=False)
+    model = LanguageModel(
+        model_name=args.model_name,
+        style=LanguageModelStyle.OpenAI,
+    )
+
+    runner = llm_utils.StreamingOpenAIRunner(args, model)
+
+    assert "extra_body" not in runner.client_kwargs
+
+
+def test_non_stream_runner_requests_one_complete_response(monkeypatch):
+    args = LLMArgs(model_name="custom-model", n=1, use_cache=False)
+    model = LanguageModel(
+        model_name=args.model_name,
+        style=LanguageModelStyle.OpenAI,
+    )
+    runner = llm_utils.StreamingOpenAIRunner(
+        args,
+        model,
+        stream=False,
+        extra_body={"enable_thinking": False},
+    )
+    observed = {}
+
+    def fake_create(**kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="answer"))]
+        )
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+    )
+    monkeypatch.setattr(runner, "_get_client", lambda: client)
+
+    assert runner._run_single([{"role": "user", "content": "prompt"}]) == ["answer"]
+    assert observed["stream"] is False
+    assert observed["extra_body"] == {"enable_thinking": False}
+
+
+def test_runner_stops_after_five_retries(monkeypatch):
+    args = LLMArgs(model_name="custom-model", n=1, use_cache=False)
+    model = LanguageModel(
+        model_name=args.model_name,
+        style=LanguageModelStyle.OpenAI,
+    )
+    runner = llm_utils.StreamingOpenAIRunner(args, model, stream=False)
+    runner.retry_delay_seconds = 0
+    attempts = 0
+
+    def fail(_payload):
+        nonlocal attempts
+        attempts += 1
+        raise llm_utils.IncompleteStreamingResponse("empty")
+
+    monkeypatch.setattr(runner, "_consume_non_stream", fail)
+
+    with pytest.raises(llm_utils.IncompleteStreamingResponse, match="empty"):
+        runner._run_single([{"role": "user", "content": "prompt"}])
+
+    assert attempts == 6
+
+
 @pytest.mark.parametrize("content", [None, "", " \n\t"])
 def test_streaming_runner_rejects_choices_without_content(monkeypatch, content):
     args = LLMArgs(model_name="custom-model", n=1, use_cache=False)
@@ -213,13 +295,14 @@ def test_single_completion_disables_payload_level_parallelism(monkeypatch):
     args = LLMArgs(model_name="custom-model", n=5, multiprocess=30)
     observed = {}
 
-    def fake_completions(request_args, payloads):
+    def fake_completions(request_args, payloads, *, stream):
         observed["n"] = request_args.n
         observed["multiprocess"] = request_args.multiprocess
         observed["payloads"] = payloads
+        observed["stream"] = stream
         return [["one choice"]]
 
-    monkeypatch.setattr(llm_utils, "get_streaming_llm_completions", fake_completions)
+    monkeypatch.setattr(llm_utils, "get_llm_completions", fake_completions)
 
     output = llm_utils.get_streaming_llm_completion(
         args, [{"role": "user", "content": "prompt"}]
@@ -230,6 +313,7 @@ def test_single_completion_disables_payload_level_parallelism(monkeypatch):
         "n": 1,
         "multiprocess": 1,
         "payloads": [[{"role": "user", "content": "prompt"}]],
+        "stream": True,
     }
 
 
@@ -268,13 +352,14 @@ def test_commit_worker_generates_scenario_and_test_together(monkeypatch):
     )
     payloads = []
 
-    def fake_completion(request_args, payload):
+    def fake_completion(request_args, payload, *, stream):
+        assert stream is False
         payloads.append(payload)
         return next(responses)
 
     monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
     monkeypatch.setattr(
-        "gso.collect.generate.generate.get_streaming_llm_completion",
+        "gso.collect.generate.generate.get_llm_completion",
         fake_completion,
     )
 
@@ -336,13 +421,14 @@ def test_commit_worker_retries_invalid_scenario_without_cache(monkeypatch):
     responses = iter([invalid_scenario, combined_output()])
     calls = []
 
-    def fake_completion(request_args, payload):
+    def fake_completion(request_args, payload, *, stream):
+        assert stream is False
         calls.append((request_args, payload))
         return next(responses)
 
     monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
     monkeypatch.setattr(
-        "gso.collect.generate.generate.get_streaming_llm_completion",
+        "gso.collect.generate.generate.get_llm_completion",
         fake_completion,
     )
 
@@ -399,13 +485,14 @@ def test_commit_worker_retries_invalid_test_without_cache(monkeypatch):
     responses = iter([invalid_output, combined_output()])
     calls = []
 
-    def fake_completion(request_args, payload):
+    def fake_completion(request_args, payload, *, stream):
+        assert stream is False
         calls.append((request_args, payload))
         return next(responses)
 
     monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
     monkeypatch.setattr(
-        "gso.collect.generate.generate.get_streaming_llm_completion",
+        "gso.collect.generate.generate.get_llm_completion",
         fake_completion,
     )
 
@@ -461,7 +548,8 @@ def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch):
     completion_calls = []
     execution_calls = []
 
-    def fake_completion(request_args, payload):
+    def fake_completion(request_args, payload, *, stream):
+        assert stream is False
         completion_calls.append((request_args, payload))
         return next(responses)
 
@@ -477,7 +565,7 @@ def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch):
 
     monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
     monkeypatch.setattr(
-        "gso.collect.generate.generate.get_streaming_llm_completion",
+        "gso.collect.generate.generate.get_llm_completion",
         fake_completion,
     )
     monkeypatch.setattr(
@@ -546,8 +634,8 @@ def test_commit_worker_skips_failed_test_slot_and_continues(monkeypatch, capsys)
 
     monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
     monkeypatch.setattr(
-        "gso.collect.generate.generate.get_streaming_llm_completion",
-        lambda request_args, payload: next(responses),
+        "gso.collect.generate.generate.get_llm_completion",
+        lambda request_args, payload, *, stream: next(responses),
     )
     monkeypatch.setattr(
         "gso.collect.generate.generate.evaluate_generated_test", fake_evaluate

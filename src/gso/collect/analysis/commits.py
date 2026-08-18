@@ -19,7 +19,7 @@ from gso.constants import *
 from gso.utils.io import *
 from gso.utils.llm import (
     configure_openai_compatible_llm,
-    get_streaming_llm_completions,
+    get_llm_completions,
 )
 
 if TYPE_CHECKING:
@@ -44,6 +44,8 @@ class PerfCommitAnalyzer:
     llm_multiprocess = DEFAULT_LLM_MULTIPROCESS
     llm_max_tokens: int | None = None
     llm_openai_timeout: int | None = None
+    llm_stream = False
+    llm_extra_body: dict | None = None
     llm_cache_settings = DEFAULT_LLM_CACHE_SETTINGS.copy()
 
     @classmethod
@@ -81,6 +83,8 @@ class PerfCommitAnalyzer:
         cls.llm_multiprocess = configured.multiprocess
         cls.llm_max_tokens = configured.max_tokens
         cls.llm_openai_timeout = configured.openai_timeout
+        cls.llm_stream = configured.stream
+        cls.llm_extra_body = configured.extra_body
         cls.llm_cache_settings = {
             stage: cache_config.get(stage, default)
             for stage, default in DEFAULT_LLM_CACHE_SETTINGS.items()
@@ -312,7 +316,12 @@ class PerfCommitAnalyzer:
             cache_stage="commit_filter", default_max_tokens=10000
         )
 
-        responses = get_streaming_llm_completions(args, prompts)
+        responses = get_llm_completions(
+            args,
+            prompts,
+            stream=PerfCommitAnalyzer.llm_stream,
+            extra_body=PerfCommitAnalyzer.llm_extra_body,
+        )
 
         filtered = []
         for commit, completions in zip(commits, responses):
@@ -352,7 +361,12 @@ class PerfCommitAnalyzer:
         llm_args = PerfCommitAnalyzer.build_llm_args(
             cache_stage="affected_files", default_max_tokens=24000
         )
-        retriever.retrieve_affected_files(commits, llm_args)
+        retriever.retrieve_affected_files(
+            commits,
+            llm_args,
+            stream=PerfCommitAnalyzer.llm_stream,
+            extra_body=PerfCommitAnalyzer.llm_extra_body,
+        )
         return retriever
 
     ######################### LLM-based API Identification #########################
@@ -416,7 +430,12 @@ class PerfCommitAnalyzer:
             cache_stage="api_identification", default_max_tokens=24000
         )
 
-        responses = get_streaming_llm_completions(args, prompts)
+        responses = get_llm_completions(
+            args,
+            prompts,
+            stream=PerfCommitAnalyzer.llm_stream,
+            extra_body=PerfCommitAnalyzer.llm_extra_body,
+        )
 
         for commit, completions in zip(commits, responses):
             try:

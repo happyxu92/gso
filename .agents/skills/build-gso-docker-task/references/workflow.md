@@ -59,6 +59,8 @@ Required identity fields are `exp_id` and `repo_url`. Recommended local-Docker f
 - `multiprocess`
 - `max_tokens`
 - `openai_timeout`
+- `stream` (defaults to `false`; set to `true` for streaming in analysis and generation)
+- `extra_body` (optional mapping passed unchanged to the OpenAI-compatible request)
 - `cache.commit_filter`, `cache.affected_files`, `cache.api_identification`, and `cache.test_generation`
 
 `cache.test_generation` defaults to `false` so generation hits the live endpoint instead of reusing stale disk-cache entries; set it to `true` to reuse prior LLM completions.
@@ -175,7 +177,7 @@ Expected artifact:
 ~/buckets/gso_bucket/experiments/EXP_ID/EXP_ID_problems.json
 ```
 
-The CLI is exposed through Fire. Keep generation's `--max_year` equal to the analysis cutoff; the workflow default is `2022`. Pass `--n 5` by default so each commit targets five accepted tests; override it only when the user explicitly requests another count. Other useful generation overrides include `--model_name`, `--multiprocess`, `--max_tokens`, `--openai_timeout`, and `--min_loc`. Docker overrides include `--docker-image`, `--docker-base-image`, `--docker-repo-path`, `--docker-cpus`, `--docker-memory`, `--docker-platform`, `--rebuild-docker-image`, `--keep-containers`, and `--keep-workspaces`.
+The CLI is exposed through Fire. Keep generation's `--max_year` equal to the analysis cutoff; the workflow default is `2022`. Pass `--n 5` by default so each commit targets five accepted tests; override it only when the user explicitly requests another count. Other useful generation overrides include `--model_name`, `--multiprocess`, `--max_tokens`, `--openai_timeout`, `--stream`, and `--min_loc`. Docker overrides include `--docker-image`, `--docker-base-image`, `--docker-repo-path`, `--docker-cpus`, `--docker-memory`, `--docker-platform`, `--rebuild-docker-image`, `--keep-containers`, and `--keep-workspaces`.
 
 Generation behavior is sequential within each commit and parallel across commits:
 

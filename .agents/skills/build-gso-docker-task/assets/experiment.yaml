@@ -10,6 +10,8 @@ llm:
   multiprocess: 1
   max_tokens: 32768
   openai_timeout: 600
+  extra_body:
+    enable_thinking: false
   cache:
     commit_filter: true
     affected_files: true
