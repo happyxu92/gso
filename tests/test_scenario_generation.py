@@ -3,6 +3,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+import yaml
 from r2e.llms.language_model import LanguageModel, LanguageModelStyle
 from r2e.llms.llm_args import LLMArgs
 
@@ -17,7 +18,9 @@ from gso.collect.generate.generate import (
     create_generation_problem,
     generate_commit_tests,
     load_existing_problems,
+    request_install_commands_from_codex,
     save_problems_atomically,
+    update_yaml_install_commands,
 )
 from gso.collect.execute.execute import (
     GeneratedTestExecutionConfig,
@@ -116,6 +119,102 @@ def test_problem_uses_default_install_commands_when_not_configured():
         "uv pip install requests",
         "uv pip show repo",
     ]
+
+
+def test_codex_install_command_inference_uses_local_repo_and_schema(
+    tmp_path, monkeypatch
+):
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    expected_commands = [
+        "uv venv --python 3.12",
+        "source .venv/bin/activate",
+        "uv pip install -e '.[test]' requests",
+    ]
+
+    def fake_run(command, **kwargs):
+        output_path = command[command.index("--output-last-message") + 1]
+        with open(output_path, "w") as file:
+            json.dump({"install_commands": expected_commands}, file)
+        assert command[command.index("--cd") + 1] == str(repo_path.resolve())
+        assert command[command.index("--sandbox") + 1] == "read-only"
+        assert "Python 3.12 is requested" in command[-1]
+        assert kwargs["check"] is False
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("gso.collect.generate.generate.subprocess.run", fake_run)
+
+    assert request_install_commands_from_codex(repo_path, "3.12") == expected_commands
+
+
+def test_codex_install_command_inference_failure_returns_none(tmp_path, monkeypatch):
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="not authenticated"
+        ),
+    )
+
+    assert request_install_commands_from_codex(repo_path, "3.12") is None
+
+
+def test_update_yaml_install_commands_replaces_empty_value(tmp_path):
+    yaml_path = tmp_path / "experiment.yaml"
+    yaml_path.write_text(
+        "# Keep this comment.\n"
+        "exp_id: demo\nrepo_url: https://github.com/example/repo\n"
+        "install_commands: []\nrepo_instr: |\n  Keep this instruction.\n"
+    )
+    commands = ["uv venv --python 3.12", "uv pip install -e ."]
+
+    update_yaml_install_commands(yaml_path, commands)
+
+    assert yaml.safe_load(yaml_path.read_text())["install_commands"] == commands
+    assert "# Keep this comment." in yaml_path.read_text()
+    assert "  Keep this instruction." in yaml_path.read_text()
+
+
+def test_generator_persists_inferred_commands_to_source_and_experiment_copy(
+    tmp_path, monkeypatch
+):
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    source_path = tmp_path / "source.yaml"
+    exp_dir = tmp_path / "exps" / "demo"
+    exp_dir.mkdir(parents=True)
+    copied_path = exp_dir / "demo.yaml"
+    yaml_text = (
+        "exp_id: demo\nrepo_url: https://github.com/example/repo\n"
+        "py_version: '3.12'\ninstall_commands: []\n"
+    )
+    source_path.write_text(yaml_text)
+    copied_path.write_text(yaml_text)
+    commands = ["uv venv --python 3.12", "uv pip install -e . requests"]
+
+    generator = PerfExpGenerator.__new__(PerfExpGenerator)
+    generator.config = {
+        "exp_id": "demo",
+        "repo_url": "https://github.com/example/repo",
+        "py_version": "3.12",
+        "install_commands": [],
+    }
+    generator.exp_id = "demo"
+    generator.exp_dir = exp_dir
+    generator.repo = SimpleNamespace(local_repo_path=repo_path)
+    args = SimpleNamespace(yaml_path=str(source_path), docker_repo_path=None)
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.request_install_commands_from_codex",
+        lambda path, py_version: commands,
+    )
+
+    generator.ensure_install_commands(args)
+
+    assert generator.config["install_commands"] == commands
+    assert yaml.safe_load(source_path.read_text())["install_commands"] == commands
+    assert yaml.safe_load(copied_path.read_text())["install_commands"] == commands
 
 
 def test_atomic_problem_save_preserves_existing_api_commit(tmp_path):

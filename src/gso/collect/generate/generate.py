@@ -1,6 +1,9 @@
 import json
 import multiprocessing as mp
 import os
+import re
+import stat
+import subprocess
 import tempfile
 import time
 import traceback
@@ -11,6 +14,7 @@ from pathlib import Path
 
 import fire
 from pebble import ProcessPool
+import yaml
 
 from r2e.multiprocess import TaskResult, TaskRunStatus
 from gso.data import PerformanceCommit, Problem, Repo, Tests
@@ -46,6 +50,164 @@ DEFAULT_GENERATION_LLM_CACHE_SETTINGS = {
 }
 GENERATION_PROGRESS_PREFIX = "Generation progress:"
 GENERATION_EVENT_PREFIX = "Generation event:"
+CODEX_INSTALL_COMMAND_TIMEOUT_SECONDS = 600
+CODEX_INSTALL_COMMAND_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+        "install_commands": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        }
+    },
+    "required": ["install_commands"],
+    "additionalProperties": False,
+}
+
+
+def request_install_commands_from_codex(
+    repo_path: str | Path,
+    py_version: str,
+) -> list[str] | None:
+    """Ask Codex to inspect a local repository and propose install commands.
+
+    Codex runs with a read-only sandbox and a response schema. Failures are
+    intentionally non-fatal so generation can fall back to ``Problem`` defaults.
+    """
+    repo_path = Path(repo_path).expanduser().resolve()
+    if not repo_path.is_dir():
+        logger.warning(
+            f"Cannot infer install commands: repository path does not exist: "
+            f"{repo_path}"
+        )
+        return None
+
+    prompt = f"""Inspect the repository in your current working directory and determine
+the shell commands needed to install it for GSO performance-test generation.
+
+Constraints:
+- The environment is Ubuntu and commands run from the repository root.
+- Python {py_version} is requested.
+- Use uv for virtual-environment creation and Python package installation when practical.
+- Include creation and activation of .venv when needed.
+- Install the repository itself plus runtime/test dependencies needed to import and exercise it.
+- Include the requests package, which the GSO harness requires.
+- Do not run installation commands and do not modify any files.
+- Return only the structured install_commands result required by the response schema.
+- Each array item must be one executable shell command, in execution order.
+"""
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="gso-codex-install-") as temp_dir:
+            temp_path = Path(temp_dir)
+            schema_path = temp_path / "schema.json"
+            output_path = temp_path / "response.json"
+            schema_path.write_text(
+                json.dumps(CODEX_INSTALL_COMMAND_SCHEMA), encoding="utf-8"
+            )
+            completed = subprocess.run(
+                [
+                    "codex",
+                    "exec",
+                    "--ephemeral",
+                    "--sandbox",
+                    "read-only",
+                    "--color",
+                    "never",
+                    "--output-schema",
+                    str(schema_path),
+                    "--output-last-message",
+                    str(output_path),
+                    "--cd",
+                    str(repo_path),
+                    prompt,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=CODEX_INSTALL_COMMAND_TIMEOUT_SECONDS,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                if len(detail) > 1000:
+                    detail = detail[-1000:]
+                logger.warning(
+                    "Codex failed to infer install commands"
+                    + (f": {detail}" if detail else "")
+                )
+                return None
+            response = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        logger.warning(f"Codex failed to infer install commands: {error}")
+        return None
+
+    commands = response.get("install_commands") if isinstance(response, dict) else None
+    if not isinstance(commands, list) or not commands:
+        logger.warning("Codex returned no install commands")
+        return None
+    if any(not isinstance(command, str) or not command.strip() for command in commands):
+        logger.warning("Codex returned invalid install commands")
+        return None
+    return [command.strip() for command in commands]
+
+
+def update_yaml_install_commands(
+    yaml_path: str | Path,
+    install_commands: list[str],
+) -> None:
+    """Atomically replace ``install_commands`` in an experiment YAML file."""
+    yaml_path = Path(yaml_path).expanduser().resolve()
+    original = yaml_path.read_text(encoding="utf-8")
+    config = yaml.safe_load(original)
+    if not isinstance(config, dict):
+        raise ValueError(f"Experiment YAML must contain a mapping: {yaml_path}")
+
+    rendered = yaml.dump(
+        {"install_commands": list(install_commands)},
+        Dumper=IndentDumper,
+        sort_keys=False,
+        allow_unicode=True,
+    )
+    lines = original.splitlines(keepends=True)
+    key_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(r"^install_commands\s*:", line)
+        ),
+        None,
+    )
+    if key_index is None:
+        separator = "" if not original or original.endswith("\n") else "\n"
+        updated = original + separator + rendered
+    else:
+        block_end = key_index + 1
+        while block_end < len(lines):
+            line = lines[block_end]
+            if line.strip() and not line[0].isspace():
+                break
+            block_end += 1
+        updated = "".join(lines[:key_index]) + rendered + "".join(lines[block_end:])
+
+    file_mode = stat.S_IMODE(yaml_path.stat().st_mode)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=yaml_path.parent,
+            prefix=f".{yaml_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temporary_path = Path(file.name)
+            file.write(updated)
+        os.chmod(temporary_path, file_mode)
+        os.replace(temporary_path, yaml_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def log_generation_event(test_context: str, event: str) -> None:
@@ -600,13 +762,48 @@ class PerfExpGenerator:
         self.configure_llm(args)
         self.exp_id = self.config["exp_id"]
         self.repo = Repo.from_url(self.config["repo_url"])
+        self.exp_dir = EXPS_DIR / self.exp_id
 
         # set repo-specific instructions
         if "repo_instr" in self.config:
             self.repo.repo_instr = self.config["repo_instr"]
 
+        self.ensure_install_commands(args)
         self.candidates = self.get_commit_map(self.repo)
-        self.exp_dir = EXPS_DIR / self.exp_id
+
+    def ensure_install_commands(self, args) -> None:
+        """Infer and persist repository-specific commands when YAML leaves them empty."""
+        if self.config.get("install_commands"):
+            return
+
+        if args.docker_repo_path is not None:
+            repo_path = Path(args.docker_repo_path).expanduser()
+        else:
+            repo_path = Path(self.repo.local_repo_path)
+
+        commands = request_install_commands_from_codex(
+            repo_path,
+            str(self.config.get("py_version", "3.9")),
+        )
+        if commands is None:
+            logger.warning(
+                "Using Problem default install commands because Codex inference failed"
+            )
+            return
+
+        source_path = Path(args.yaml_path).expanduser().resolve()
+        copied_path = (self.exp_dir / f"{self.exp_id}.yaml").resolve()
+        yaml_paths = [source_path]
+        if copied_path != source_path:
+            yaml_paths.append(copied_path)
+        for yaml_path in yaml_paths:
+            update_yaml_install_commands(yaml_path, commands)
+        self.config["install_commands"] = list(commands)
+        print(
+            f"Codex inferred {len(commands)} install command(s) from {repo_path}; "
+            f"updated {source_path}",
+            flush=True,
+        )
 
     def configure_llm(self, args) -> None:
         """Apply optional experiment LLM settings to test generation.

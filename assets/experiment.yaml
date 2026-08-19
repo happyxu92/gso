@@ -27,7 +27,8 @@ api_docs: |
 
 py_version: "3.12"
 target_commit: "main"
-# Leave empty to use the default commands defined by Problem.
+# Leave empty to let generate.py ask Codex to infer commands from the local repo.
+# If inference fails, generation falls back to the defaults defined by Problem.
 install_commands: []
 
 repo_instr: |
