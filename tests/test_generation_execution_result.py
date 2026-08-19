@@ -8,7 +8,7 @@ from gso.collect.execute.execute import GeneratedTestExecutionConfig
 from gso.data import PerformanceCommit, Problem, Repo
 
 
-def test_generation_validation_accepts_quick_commit_hash(monkeypatch, tmp_path):
+def test_generation_validation_accepts_clean_phase1_exit(monkeypatch, tmp_path):
     commit = PerformanceCommit(
         commit_hash="abcdef1234567890",
         subject="speed up",
@@ -33,19 +33,8 @@ def test_generation_validation_accepts_quick_commit_hash(monkeypatch, tmp_path):
 
     class FakeManager:
         def __init__(self, **kwargs):
-            collected = kwargs["problems"][0]
-            collected.add_results(
-                "run0",
-                [
-                    {
-                        "commit": commit.quick_hash(),
-                        "base_result": "Execution time: 2.0s",
-                        "commit_result": "Execution time: 1.0s",
-                    }
-                ],
-            )
-            self.problems = [collected]
-            self.tasks = {}
+            self.problems = kwargs["problems"]
+            self.tasks = {"run0": SimpleNamespace(failed=False)}
 
         def initialize_problems(self):
             pass

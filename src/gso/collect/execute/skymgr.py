@@ -136,7 +136,13 @@ class SkyManager:
         return "SUCCEEDED" in result.stdout.decode("utf-8")
 
     @staticmethod
-    def get_results(workspace, cluster="sky-gso"):
+    def get_results(workspace, cluster="sky-gso", *, expect_results=True):
+        if not expect_results:
+            return (
+                f"Cluster {cluster}: phase-1 validation; "
+                "result collection skipped (not expected)",
+                [],
+            )
         subprocess.run(
             ["rsync", "-Pavz", f"{cluster}:~/sky_workdir/results/*", "./results/"],
             cwd=workspace,

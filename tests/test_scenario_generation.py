@@ -1,4 +1,5 @@
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -589,28 +590,40 @@ def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch, 
     retry_instruction = completion_calls[1][1][-1]["content"]
     assert "semantic retry 1 of 3" in retry_instruction
     assert "candidate output differs from reference" in retry_instruction
-    assert capsys.readouterr().out.splitlines() == [
-        f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 requesting test",
+    output_lines = [
+        re.sub(r"(?<==)\d+\.\d+s", "<seconds>", line)
+        for line in capsys.readouterr().out.splitlines()
+    ]
+    assert output_lines == [
         (
-            f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 "
-            "starting test (attempt 1/4)"
+            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
+            "test 1/1 | requesting test"
         ),
         (
-            f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 "
-            "test failed (log: /tmp/test-execution.log)"
+            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
+            "test 1/1 | starting test (attempt 1/4)"
         ),
         (
-            f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 "
-            "re-requesting test (semantic retry 1/3)"
+            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
+            "test 1/1 | test failed (log: /tmp/test-execution.log)"
         ),
         (
-            f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 "
-            "starting test (attempt 2/4)"
+            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
+            "test 1/1 | re-requesting test (semantic retry 1/3)"
         ),
-        f"{GENERATION_EVENT_PREFIX} repo.target/abcdef1 scenario/test 1 test passed",
         (
-            f"{GENERATION_PROGRESS_PREFIX} repo.target/abcdef1 test 1/1 accepted "
-            "(accepted=1, skipped=0)"
+            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
+            "test 1/1 | starting test (attempt 2/4)"
+        ),
+        (
+            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
+            "test 1/1 | test passed"
+        ),
+        (
+            f"{GENERATION_PROGRESS_PREFIX} target 1/1 | repo.target/abcdef1 | "
+            "test 1/1 accepted | accepted=1 | skipped=0 | "
+            "semantic_retries=1 | elapsed=<seconds> | llm=<seconds> | "
+            "validation=<seconds> | slots complete"
         ),
     ]
 
@@ -690,17 +703,23 @@ def test_commit_worker_skips_failed_test_slot_and_continues(monkeypatch, capsys)
     assert result.test_attempts[-1]["scenario_index"] == 2
     assert result.test_attempts[-1]["error"] is None
     assert "# title: second" in result.commit_tests.samples[0]
-    output_lines = capsys.readouterr().out.splitlines()
+    output_lines = [
+        re.sub(r"(?<==)\d+\.\d+s", "<seconds>", line)
+        for line in capsys.readouterr().out.splitlines()
+    ]
     assert [
         line for line in output_lines if line.startswith(GENERATION_PROGRESS_PREFIX)
     ] == [
         (
-            f"{GENERATION_PROGRESS_PREFIX} repo.target/abcdef1 test 1/2 skipped "
-            "(accepted=0, skipped=1)"
+            f"{GENERATION_PROGRESS_PREFIX} target 1/1 | repo.target/abcdef1 | "
+            "test 1/2 skipped | accepted=0 | skipped=1 | semantic_retries=3 | "
+            "elapsed=<seconds> | llm=<seconds> | validation=<seconds>"
         ),
         (
-            f"{GENERATION_PROGRESS_PREFIX} repo.target/abcdef1 test 2/2 accepted "
-            "(accepted=1, skipped=1)"
+            f"{GENERATION_PROGRESS_PREFIX} target 1/1 | repo.target/abcdef1 | "
+            "test 2/2 accepted | accepted=1 | skipped=1 | "
+            "semantic_retries=3 | elapsed=<seconds> | llm=<seconds> | "
+            "validation=<seconds> | slots complete"
         ),
     ]
 
@@ -758,6 +777,11 @@ def test_generator_skips_failed_commit_and_saves_successful_commit(
         ),
     ]
     saved = {}
+    parallel_call = {}
+
+    def fake_run_tasks(function, tasks, **kwargs):
+        parallel_call.update(function=function, tasks=tasks, kwargs=kwargs)
+        return outputs
 
     monkeypatch.setattr(
         "gso.collect.generate.generate.prepare_generated_test_execution",
@@ -765,7 +789,7 @@ def test_generator_skips_failed_commit_and_saves_successful_commit(
     )
     monkeypatch.setattr(
         "gso.collect.generate.generate.run_tasks_in_parallel",
-        lambda *args, **kwargs: outputs,
+        fake_run_tasks,
     )
     monkeypatch.setattr(
         "gso.collect.generate.generate.validate_problem_test_samples",
@@ -788,6 +812,9 @@ def test_generator_skips_failed_commit_and_saves_successful_commit(
     assert problems[0].commits == [successful_commit]
     assert problems[0].tests == [successful_tests]
     assert saved["path"] == tmp_path / "repo_problems.json"
+    assert [task.target_index for task in parallel_call["tasks"]] == [0, 1]
+    assert [task.target_count for task in parallel_call["tasks"]] == [2, 2]
+    assert parallel_call["kwargs"]["use_progress_bar"] is False
     assert len(saved["diagnostics"]) == 1
     assert saved["diagnostics"][0]["commit_hash"] == failed_commit.commit_hash
     assert saved["diagnostics"][0]["error"] == "commit setup failed"

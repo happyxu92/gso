@@ -11,6 +11,9 @@ llm:
   max_tokens: 32768
   openai_timeout: 600
   extra_body:
+    thinking:
+      type: disabled
+    reasoning_effort: none
     enable_thinking: false
   cache:
     commit_filter: true

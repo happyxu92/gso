@@ -407,11 +407,24 @@ WORKDIR /workspace
             return None
         return int(state.get("ExitCode", 1))
 
-    def get_results(self, workspace: Path, cluster: str = "docker-gso"):
+    def get_results(
+        self,
+        workspace: Path,
+        cluster: str = "docker-gso",
+        *,
+        expect_results: bool = True,
+    ):
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         logs = self._run(["docker", "logs", cluster], check=False, capture_output=True)
         log_path = self.artifact_dir / f"{cluster}.log"
         log_path.write_text((logs.stdout or "") + (logs.stderr or ""))
+
+        if not expect_results:
+            return (
+                f"Container {cluster}: phase-1 validation; "
+                f"result collection skipped (not expected); log={log_path}",
+                [],
+            )
 
         results_dir = Path(workspace) / "results"
         results_dir.mkdir(parents=True, exist_ok=True)

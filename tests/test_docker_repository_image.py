@@ -104,3 +104,32 @@ def test_build_repository_image_requires_one_repository(tmp_path):
                 make_problem("https://github.com/example/other", "other"),
             ]
         )
+
+
+def test_phase1_result_collection_skips_missing_results_directory(
+    tmp_path, monkeypatch
+):
+    artifact_dir = tmp_path / "artifacts"
+    workspace = tmp_path / "workspace"
+    manager = DockerManager(image="gso-repo:latest", artifact_dir=artifact_dir)
+    commands = []
+
+    def fake_run(command, *, check=True, capture_output=False):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="phase 1 output\n", stderr="")
+
+    monkeypatch.setattr(manager, "_run", fake_run)
+
+    message, results = manager.get_results(
+        workspace,
+        "docker-gso-phase1",
+        expect_results=False,
+    )
+
+    assert commands == [["docker", "logs", "docker-gso-phase1"]]
+    assert results == []
+    assert "phase-1 validation" in message
+    assert "result collection skipped (not expected)" in message
+    assert "result copy failed" not in message
+    assert not (workspace / "results").exists()
+    assert (artifact_dir / "docker-gso-phase1.log").read_text() == "phase 1 output\n"

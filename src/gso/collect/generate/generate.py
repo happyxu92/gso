@@ -2,8 +2,9 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,6 +69,8 @@ class CommitGenerationTask:
     commit: PerformanceCommit
     args: PerfExpGenArgs
     execution_config: GeneratedTestExecutionConfig | None = None
+    target_index: int = 0
+    target_count: int = 1
 
 
 @dataclass
@@ -236,6 +239,9 @@ def _prepare_semantic_retry(
 
 def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
     """Generate, execute, and accept one scenario/test at a time for a commit."""
+    generation_started = time.monotonic()
+    llm_seconds = 0.0
+    validation_seconds = 0.0
     result = CommitGenerationResult(
         problem_index=task.problem_index,
         commit_index=task.commit_index,
@@ -273,6 +279,11 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                 f"{task.problem.pid}/{task.commit.quick_hash()} "
                 f"scenario/test {scenario_index}"
             )
+            event_context = (
+                f"target {task.target_index + 1}/{task.target_count} | "
+                f"{task.problem.pid}/{task.commit.quick_hash()} | "
+                f"test {scenario_index}/{task.args.n} |"
+            )
             test_error: GeneratedTestError | None = None
             for retry_number in range(SEMANTIC_RETRY_COUNT + 1):
                 execution_log = None
@@ -292,19 +303,23 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                 raw_output = None
                 try:
                     if retry_number == 0:
-                        log_generation_event(test_context, "requesting test")
+                        log_generation_event(event_context, "requesting test")
                     else:
                         log_generation_event(
-                            test_context,
+                            event_context,
                             f"re-requesting test (semantic retry "
                             f"{retry_number}/{SEMANTIC_RETRY_COUNT})",
                         )
                     try:
-                        raw_output = get_llm_completion(
-                            request_args,
-                            attempt_payload,
-                            stream=request_args.stream,
-                        )
+                        completion_started = time.monotonic()
+                        try:
+                            raw_output = get_llm_completion(
+                                request_args,
+                                attempt_payload,
+                                stream=request_args.stream,
+                            )
+                        finally:
+                            llm_seconds += time.monotonic() - completion_started
                     except Exception as completion_exception:
                         raise GeneratedTestError(
                             f"{test_context}: LLM completion raised "
@@ -321,20 +336,26 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                     )
                     if task.execution_config is not None:
                         log_generation_event(
-                            test_context,
+                            event_context,
                             f"starting test (attempt {retry_number + 1}/"
                             f"{SEMANTIC_RETRY_COUNT + 1})",
                         )
                         try:
-                            execution_result = evaluate_generated_test(
-                                task.problem,
-                                task.commit,
-                                generated_test,
-                                task.execution_config,
-                            )
+                            validation_started = time.monotonic()
+                            try:
+                                execution_result = evaluate_generated_test(
+                                    task.problem,
+                                    task.commit,
+                                    generated_test,
+                                    task.execution_config,
+                                )
+                            finally:
+                                validation_seconds += (
+                                    time.monotonic() - validation_started
+                                )
                         except Exception as execution_exception:
                             log_generation_event(
-                                test_context,
+                                event_context,
                                 "test failed "
                                 f"({type(execution_exception).__name__}: "
                                 f"{execution_exception})",
@@ -350,7 +371,7 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                                 "Generated test execution failed without diagnostics"
                             )
                             log_generation_event(
-                                test_context,
+                                event_context,
                                 "test failed"
                                 + (
                                     f" (log: {execution_log})"
@@ -362,7 +383,7 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                                 f"{test_context}: automated execution failed:\n"
                                 f"{execution_error}"
                             )
-                        log_generation_event(test_context, "test passed")
+                        log_generation_event(event_context, "test passed")
                 except GeneratedTestError as error:
                     attempt = {
                         "scenario_index": scenario_index,
@@ -415,15 +436,24 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                 slot_status = "accepted"
                 break
 
-            # tqdm's carriage-return updates are not visible while generate.py is
-            # captured by run_pipeline.py. Emit one newline-delimited record per
-            # completed slot so the pipeline can relay useful progress without
-            # enabling its otherwise noisy --verbose output.
+            semantic_retries = sum(
+                attempt["retry_number"] > 0 for attempt in result.test_attempts
+            )
+            slot_completion = (
+                " | slots complete" if scenario_index == task.args.n else ""
+            )
+            elapsed_seconds = time.monotonic() - generation_started
             print(
-                f"{GENERATION_PROGRESS_PREFIX} {task.problem.pid}/"
-                f"{task.commit.quick_hash()} test {scenario_index}/{task.args.n} "
-                f"{slot_status} (accepted={len(generated_tests)}, "
-                f"skipped={len(result.failed_test_slots)})",
+                f"{GENERATION_PROGRESS_PREFIX} "
+                f"target {task.target_index + 1}/{task.target_count} | "
+                f"{task.problem.pid}/{task.commit.quick_hash()} | "
+                f"test {scenario_index}/{task.args.n} {slot_status} | "
+                f"accepted={len(generated_tests)} | "
+                f"skipped={len(result.failed_test_slots)} | "
+                f"semantic_retries={semantic_retries} | "
+                f"elapsed={elapsed_seconds:.1f}s | "
+                f"llm={llm_seconds:.1f}s | "
+                f"validation={validation_seconds:.1f}s{slot_completion}",
                 flush=True,
             )
 
@@ -651,6 +681,14 @@ class PerfExpGenerator:
         ]
         if not commit_tasks:
             raise RuntimeError("No commit generation tasks were prepared")
+        commit_tasks = [
+            replace(
+                task,
+                target_index=target_index,
+                target_count=len(commit_tasks),
+            )
+            for target_index, task in enumerate(commit_tasks)
+        ]
 
         repo_path = args.docker_repo_path
         if repo_path is None:
@@ -673,10 +711,7 @@ class PerfExpGenerator:
             ),
         )
         commit_tasks = [
-            CommitGenerationTask(
-                **{**task.__dict__, "execution_config": execution_config}
-            )
-            for task in commit_tasks
+            replace(task, execution_config=execution_config) for task in commit_tasks
         ]
 
         commit_workers = min(args.multiprocess, len(commit_tasks))
@@ -689,9 +724,8 @@ class PerfExpGenerator:
         generation_outputs = run_tasks_in_parallel(
             generate_commit_tests,
             commit_tasks,
-            use_progress_bar=True,
+            use_progress_bar=False,
             num_workers=commit_workers,
-            progress_bar_desc="Generating commit tests",
         )
 
         generation_errors = []

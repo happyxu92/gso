@@ -273,7 +273,10 @@ class ExecutionManager:
                 message, results = await loop.run_in_executor(
                     self.thread_pool,
                     functools.partial(
-                        self.runtime.get_results, state.workspace, cluster
+                        self.runtime.get_results,
+                        state.workspace,
+                        cluster,
+                        expect_results=not self.phase1_only,
                     ),
                 )
                 state.problem.add_results(key=self._result_key(state), results=results)
