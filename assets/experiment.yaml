@@ -24,10 +24,8 @@ api_docs: |
 
 py_version: "3.12"
 target_commit: "main"
-install_commands:
-  - "uv venv --python 3.12"
-  - "source .venv/bin/activate"
-  - "uv pip install -e ."
+# Leave empty to use the default commands defined by Problem.
+install_commands: []
 
 repo_instr: |
   Generate deterministic CPU-only workloads and keep setup outside the timed region.

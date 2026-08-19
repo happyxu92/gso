@@ -121,20 +121,26 @@ PR_INFO = """
 """
 
 
-SCENARIO_TEST_MSG = """Design exactly one new performance-test scenario for the `{api}` API in the `{repo_name}` repository, then implement that scenario as the one complete Python performance test requested by the system instructions.
+SCENARIO_TEST_MSG = """Create one benchmark scenario and its complete Python test for `{api}` in `{repo_name}`.
 
-Requirements:
-1. The scenario and test must exercise the target API and be relevant to the supplied optimization commit.
-2. The scenario must describe the exact realistic, non-trivial workload implemented by the test, with setup kept outside the timed experiment.
-3. The new scenario must differ materially from every scenario listed below (both successful and failed) in input structure, data distribution, scale, API usage path, or optimized behavior. Do not vary only arbitrary parameter values. In particular, do not reuse a failed scenario whose test was rejected.
-4. Use reproducible inputs and avoid uniform, sorted, repeating, or easily hackable patterns.
-5. Keep the scenario and implementation consistent; do not describe one workload and implement another.
-6. Describe how the result can be stored and compared with a reference result.
-7. Scale the workload so the base/parent commit's `experiment` run takes roughly 1–60 seconds (ideally ~1–30s), well under the ~300s per-iteration timeout. State the approximate parent-run duration and the chosen data size in the `input_characteristics` field. Because speedup is a ratio, not an absolute time, a ~30s parent run is enough to expose a large speedup; prefer shrinking data volume over dropping realism when a workload is too slow.
+## Scenario selection
+- Study the supplied commit message and diff first. Exercise the behavior or data path the optimization changes, not merely the same API name.
+- The test runs on the parent commit, so use only APIs and behavior available before the optimization.
+- Choose one realistic, non-trivial workload. It must differ materially from every previous successful or failed scenario in workload shape, data distribution, scale, API path, or optimized behavior; changing only arbitrary values is insufficient.
+- Do not reuse a failed scenario. Avoid uniform, sorted, repeating, or otherwise easily special-cased inputs.
 
-Return exactly two fenced blocks and no explanatory text before, between, or after them.
+## Test implementation
+- Implement exactly the workload described by the scenario, and call the target API on the timed path.
+- Keep downloads, data construction, and other setup outside `experiment`; time only the workload of interest.
+- Make inputs deterministic and reproducible while retaining realistic diversity.
+- Store enough output to compare the current result with the reference, and make `check_equivalence` sensitive to meaningful incorrect results.
+- Target roughly 1–60 seconds for one parent-commit `experiment` run, ideally 1–30 seconds and safely below the ~300-second timeout. Include the chosen data size and estimated parent runtime in `input_characteristics`; reduce data volume rather than realism if necessary.
+- Follow every function, timing, and harness requirement in the system message.
 
-First, return one `json` block with this exact shape:
+## Output contract
+Return exactly two fenced blocks and no other text.
+
+First, return one `json` block with exactly these string fields:
 ```json
 {{
   "title": "short scenario name",
@@ -143,18 +149,19 @@ First, return one `json` block with this exact shape:
   "api_usage": "how the target API is exercised",
   "optimization_focus": "commit behavior this scenario measures",
   "equivalence_strategy": "what result is stored and compared",
-  "distinguishing_factor": "how this differs materially from previous successful scenarios"
+  "distinguishing_factor": "how this differs materially from all previous scenarios"
 }}
 ```
 
-Second, return one `python` block containing the complete test implementation with every required function:
+Second, return one `python` block containing the complete runnable test with every required function:
 ```python
 # complete test implementation
 ```
 
-This is test {scenario_number} of {scenario_count}.
+## Generation state
+This is scenario {scenario_number} of {scenario_count}.
 
-Previously generated scenarios (full plans for successful ones; title plus rejection reason for failed ones):
+Previous scenarios (successful plans are complete; failed entries include their rejection reason):
 {previous_scenarios}
 """
 

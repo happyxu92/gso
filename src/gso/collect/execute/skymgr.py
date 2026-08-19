@@ -5,7 +5,7 @@ from pathlib import Path
 from string import Template
 
 from gso.collect.execute.helpers import collect_results, add_tokens_to_installs
-from gso.harness.environment.patches import apply_patches_to_tests
+from gso.harness.environment.patches import apply_patches, ensure_patch_dependencies
 from gso.constants import *
 from gso.logger import logger
 
@@ -31,7 +31,10 @@ class SkyManager:
         temp_dir, task, phase1, phase2, problem, phase1_only: bool = False
     ):
         setup_commands = "\n  ".join(problem.setup_commands)
-        install_commands = add_tokens_to_installs(problem.install_commands)
+        install_commands = ensure_patch_dependencies(
+            problem.pid, problem.install_commands
+        )
+        install_commands = add_tokens_to_installs(install_commands)
         install_commands = "\n        ".join(install_commands)
         candidates = " ".join(t.quick_hash for t in problem.tests)
 
@@ -89,8 +92,7 @@ class SkyManager:
                 commit_dir.mkdir(parents=True, exist_ok=True)
                 test_samples = commit_tests.samples
 
-                # optional: uncomment to not apply patched requests.get function
-                test_samples = apply_patches_to_tests("requests", test_samples)
+                test_samples = apply_patches(problem.pid, test_samples)
 
                 # write sampled tests for each commit
                 for i, sample in enumerate(test_samples):

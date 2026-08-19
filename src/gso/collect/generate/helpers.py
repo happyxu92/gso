@@ -153,48 +153,6 @@ def extract_json_block(output: str, *, context: str = "scenario response") -> st
     return content
 
 
-def get_generated_scenarios(
-    output: str,
-    *,
-    expected_count: int,
-    context: str = "scenario response",
-) -> list[TestScenario]:
-    """Parse and validate the scenarios returned in one model choice."""
-    content = extract_json_block(output, context=context)
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise GeneratedScenarioError(
-            f"{context}: invalid JSON at line {exc.lineno}, column {exc.colno}: "
-            f"{exc.msg}"
-        ) from exc
-
-    if not isinstance(parsed, dict):
-        raise GeneratedScenarioError(
-            f"{context}: expected a JSON object with a 'scenarios' array"
-        )
-    raw_scenarios = parsed.get("scenarios")
-    if not isinstance(raw_scenarios, list):
-        raise GeneratedScenarioError(
-            f"{context}: expected 'scenarios' to be a JSON array"
-        )
-    if len(raw_scenarios) != expected_count:
-        raise GeneratedScenarioError(
-            f"{context}: expected {expected_count} scenario(s), "
-            f"got {len(raw_scenarios)}"
-        )
-
-    scenarios = []
-    for index, raw_scenario in enumerate(raw_scenarios):
-        try:
-            scenarios.append(TestScenario.model_validate(raw_scenario))
-        except ValidationError as exc:
-            raise GeneratedScenarioError(
-                f"{context}, scenario {index + 1}: invalid scenario structure: {exc}"
-            ) from exc
-    return scenarios
-
-
 def get_generated_scenario_and_test(
     output: str, *, context: str = "scenario/test response"
 ) -> tuple[TestScenario, str]:

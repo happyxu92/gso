@@ -20,7 +20,7 @@ from gso.harness.environment.docker_utils import (
     remove_image,
 )
 from gso.harness.environment.dockerfile import get_dockerfile_instance
-from gso.harness.environment.patches import apply_patches
+from gso.harness.environment.patches import apply_patches, ensure_patch_dependencies
 from gso.harness.grading.evalscript import get_eval_script
 from gso.harness.utils import close_logger, setup_logger
 from gso.utils.multiprocess import run_tasks_in_parallel_iter
@@ -248,6 +248,9 @@ def build_instance_images(
         )
 
         inst.tests = apply_patches(inst.instance_id, inst.tests)
+        inst.install_commands = ensure_patch_dependencies(
+            inst.instance_id, inst.install_commands
+        )
 
         is_high_resource = inst.repo in HIGH_RESOURCE_REPOS
 

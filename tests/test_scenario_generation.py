@@ -23,7 +23,6 @@ from gso.collect.execute.execute import (
 from gso.collect.generate.helpers import (
     GeneratedScenarioError,
     get_generated_scenario_and_test,
-    get_generated_scenarios,
 )
 from gso.data import PerformanceCommit, Problem, Repo, Tests as CommitTests
 from gso.utils import llm as llm_utils
@@ -114,25 +113,6 @@ def test_problem_uses_default_install_commands_when_not_configured():
         "uv pip install requests",
         "uv pip show repo",
     ]
-
-
-def test_generated_scenarios_require_expected_count_and_fields():
-    scenarios = [
-        {**SCENARIO_TEMPLATE, "title": "first"},
-        {**SCENARIO_TEMPLATE, "title": "second"},
-    ]
-    output = f"```json\n{json.dumps({'scenarios': scenarios})}\n```"
-
-    parsed = get_generated_scenarios(output, expected_count=2)
-
-    assert [scenario.title for scenario in parsed] == ["first", "second"]
-
-    with pytest.raises(GeneratedScenarioError, match="expected 3 scenario"):
-        get_generated_scenarios(output, expected_count=3)
-
-    del scenarios[0]["workload"]
-    with pytest.raises(GeneratedScenarioError, match="invalid scenario structure"):
-        get_generated_scenarios(json.dumps({"scenarios": scenarios}), expected_count=2)
 
 
 def test_generated_scenario_and_test_are_parsed_from_one_completion():
@@ -323,6 +303,7 @@ def test_commit_worker_generates_scenario_and_test_together(monkeypatch):
         repo_url="https://github.com/example/repo",
         repo_owner="example",
         repo_name="repo",
+        repo_instr="Use repository fixtures.",
     )
     commit = PerformanceCommit(
         commit_hash="abcdef1234567890",
@@ -342,7 +323,11 @@ def test_commit_worker_generates_scenario_and_test_together(monkeypatch):
     def fake_prepare(task_args):
         _, _, prepared_commit, _ = task_args
         commit_tests = CommitTests.from_commit(prepared_commit)
-        commit_tests.init_chat("test system", "commit context", "write test")
+        commit_tests.init_chat(
+            "test system",
+            "commit context",
+            "write test\n\nRepo-specific Instructions:\nUse repository fixtures.",
+        )
         return commit_tests
 
     responses = iter(
@@ -380,8 +365,16 @@ def test_commit_worker_generates_scenario_and_test_together(monkeypatch):
     assert result.commit_tests.num_samples() == 2
     assert len(payloads) == 2
     assert payloads[0][0]["content"] == "test system"
-    assert "exactly two fenced blocks" in payloads[0][-1]["content"]
-    assert '"title":"first"' in payloads[1][-1]["content"].replace(" ", "")
+    assert [message["role"] for message in payloads[0]] == ["system", "user"]
+    assert payloads[0][1]["content"].startswith("commit context\n\nCreate one benchmark")
+    assert "write test" not in payloads[0][1]["content"]
+    assert payloads[0][1]["content"].count("Use repository fixtures.") == 1
+    assert "Return exactly two fenced blocks" in payloads[0][1]["content"]
+    assert "use only APIs and behavior available before the optimization" in (
+        payloads[0][1]["content"]
+    )
+    assert [message["role"] for message in payloads[1]] == ["system", "user"]
+    assert '"title":"first"' in payloads[1][1]["content"].replace(" ", "")
     # Duplicate test code is intentionally accepted; no deduplication is performed.
     assert len(result.test_outputs) == 2
     assert result.commit_tests.samples[0].startswith("# GSO generated scenario:")
@@ -450,6 +443,7 @@ def test_commit_worker_retries_invalid_scenario_without_cache(monkeypatch):
     assert len(calls) == 2
     assert calls[0][0].use_cache is True
     assert calls[1][0].use_cache is False
+    assert [message["role"] for message in calls[1][1]] == ["system", "user"]
     retry_instruction = calls[1][1][-1]["content"]
     assert "semantic retry 1 of 3" in retry_instruction
     assert "invalid JSON" in retry_instruction

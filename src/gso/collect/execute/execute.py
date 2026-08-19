@@ -427,6 +427,15 @@ def _create_runtime(config: GeneratedTestExecutionConfig, exp_dir: Path):
     raise ValueError("backend must be 'sky' or 'docker'")
 
 
+def _apply_experiment_overrides(problems: list[Problem], exp_data: dict) -> None:
+    """Apply explicit execution overrides while preserving model defaults."""
+    configured_install_commands = exp_data.get("install_commands") or []
+    for problem in problems:
+        problem.target_commit = exp_data.get("target_commit", "main")
+        if configured_install_commands:
+            problem.install_commands = list(configured_install_commands)
+
+
 def prepare_generated_test_execution(
     problems: list[Problem], config: GeneratedTestExecutionConfig
 ) -> GeneratedTestExecutionConfig:
@@ -621,9 +630,7 @@ async def async_main(
             raise ValueError(f"Experiment YAML not found: {exp_yaml_path}")
         with exp_yaml_path.open() as f:
             exp_data = yaml.safe_load(f) or {}
-        for problem in all_problems:
-            problem.target_commit = exp_data.get("target_commit", "main")
-            problem.install_commands = list(exp_data.get("install_commands", []))
+        _apply_experiment_overrides(all_problems, exp_data)
 
     if specific_api:
         problems = [problem for problem in all_problems if problem.api == specific_api]

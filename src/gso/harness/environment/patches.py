@@ -210,16 +210,35 @@ PATCH_REGISTRY = {
     "requests": {
         "description": "Enable caching, Disable SSL verification, and Add User-agent in requests",
         "apply": apply_patch_requests,
+        "install_commands": ["uv pip install requests"],
         "instances": [],  # apply to all instances
     },
 }
 
 
+def _applies_to_instance(instance_id: str, patch_info: dict) -> bool:
+    patch_instances = patch_info.get("instances", [])
+    return patch_instances == [] or instance_id in patch_instances
+
+
+def ensure_patch_dependencies(
+    instance_id: str, install_commands: list[str]
+) -> list[str]:
+    """Add dependencies required by patches that apply to an instance."""
+    commands = list(install_commands)
+    for patch_info in PATCH_REGISTRY.values():
+        if not _applies_to_instance(instance_id, patch_info):
+            continue
+        for command in patch_info.get("install_commands", []):
+            if command not in commands:
+                commands.append(command)
+    return commands
+
+
 def apply_patches(instance_id: str, tests: list[str]) -> list[str]:
     patched_tests = tests.copy()
-    for patch_name, patch_info in PATCH_REGISTRY.items():
-        patch_instances = patch_info.get("instances", [])
-        if patch_instances == [] or instance_id in patch_info.get("instances", []):
+    for patch_info in PATCH_REGISTRY.values():
+        if _applies_to_instance(instance_id, patch_info):
             patch_func = patch_info.get("apply")
             if patch_func:
                 patched_tests = [patch_func(test) for test in patched_tests]

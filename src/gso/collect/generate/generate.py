@@ -161,10 +161,41 @@ def add_scenario_comment(test: str, scenario: TestScenario) -> str:
 def prepare_model_payload(
     model_name: str, messages: list[dict[str, str]]
 ) -> list[dict[str, str]]:
-    """Apply model-specific chat formatting without changing sampling behavior."""
+    """Merge user content and apply model-specific chat formatting."""
+    user_content = "\n\n".join(
+        message["content"] for message in messages if message["role"] == "user"
+    )
+    merged_messages: list[dict[str, str]] = []
+    user_added = False
+    for message in messages:
+        if message["role"] != "user":
+            merged_messages.append(dict(message))
+        elif not user_added:
+            merged_messages.append({"role": "user", "content": user_content})
+            user_added = True
+
     if model_name in REASONING_MODELS:
-        prompt = "\n\n".join(message["content"] for message in messages)
+        prompt = "\n\n".join(message["content"] for message in merged_messages)
         return [{"role": "user", "content": prompt}]
+    return merged_messages
+
+
+def _prepare_generation_messages(
+    base_messages: list[dict[str, str]], task_message: str
+) -> list[dict[str, str]]:
+    """Replace the generic prepared task with the scenario-specific task.
+
+    ``prepare_mp_helper`` supplies separate user messages for commit context and a
+    legacy "write a test" task. The detailed scenario task supersedes that generic
+    task, so retaining both only repeats instructions (including repo guidance).
+    """
+    messages = [dict(message) for message in base_messages]
+    user_indices = [
+        index for index, message in enumerate(messages) if message["role"] == "user"
+    ]
+    if len(user_indices) >= 2:
+        messages.pop(user_indices[-1])
+    messages.append({"role": "user", "content": task_message})
     return messages
 
 
@@ -182,19 +213,21 @@ def _prepare_semantic_retry(
     if previous_error is None:
         raise ValueError("A semantic retry requires the previous validation error")
 
-    retry_payload = [dict(message) for message in payload]
-    retry_payload.append(
-        {
-            "role": "user",
-            "content": (
-                "Automated validation rejected the previous completion:\n"
-                f"{previous_error}\n\n"
-                f"This is semantic retry {retry_number} of "
-                f"{SEMANTIC_RETRY_COUNT}. Regenerate the complete response from "
-                f"scratch. {output_requirement}"
-            ),
-        }
+    retry_instruction = (
+        "Automated validation rejected the previous completion:\n"
+        f"{previous_error}\n\n"
+        f"This is semantic retry {retry_number} of "
+        f"{SEMANTIC_RETRY_COUNT}. Regenerate the complete response from "
+        f"scratch. {output_requirement}"
     )
+    retry_payload = [dict(message) for message in payload]
+    user_message = next(
+        (message for message in retry_payload if message["role"] == "user"), None
+    )
+    if user_message is None:
+        retry_payload.append({"role": "user", "content": retry_instruction})
+    else:
+        user_message["content"] += f"\n\n{retry_instruction}"
     # A failed first attempt may already be cached. Retrying without cache ensures
     # that validation does not repeatedly receive the same invalid completion.
     retry_args = args.model_copy(update={"use_cache": False})
@@ -230,10 +263,9 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
                 combined_task += (
                     "\n\nRepo-specific Instructions:\n" f"{task.repo.repo_instr}\n"
                 )
-            combined_messages = [
-                *[dict(message) for message in commit_tests.chat_messages],
-                {"role": "user", "content": combined_task},
-            ]
+            combined_messages = _prepare_generation_messages(
+                commit_tests.chat_messages, combined_task
+            )
             combined_payload = prepare_model_payload(
                 task.args.model_name, combined_messages
             )

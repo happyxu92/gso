@@ -62,13 +62,10 @@ llm:
         api_identification: true
 py_version: 3.9
 target_commit: "main"
-install_commands:
-    - "uv venv --python 3.9"
-    - "source .venv/bin/activate"
-    - "uv pip install -e ."
+install_commands: []
 ```
 
-You can add the repository URL and custom python version & installation commands. The optional `llm` mapping configures the model used by commit analysis and performance-test generation; explicit generation CLI values for `model_name`, `multiprocess`, `max_tokens`, `openai_timeout`, `stream`, and `extra_body` take precedence. Both analysis and generation default to non-stream responses; set `llm.stream: true` to enable streaming for all four LLM stages. Provider-specific request fields can be supplied through the generic `llm.extra_body` mapping and are passed unchanged to both transport modes. Generated performance tests default to `max_tokens: 32768` and `openai_timeout: 600` seconds. Transport failures are retried at most five times. The optional `llm.cache` mapping controls response caching for the `commit_filter`, `affected_files`, and `api_identification` analysis stages. All three stages default to `true`. Each value must be a YAML boolean. You can also specify `api_docs` and `repo_instr` (free form strings) to specify APIs to focus on during analysis and custom performance test generation tips. Generation uses YAML `install_commands` when configured; otherwise it uses the
+You can add the repository URL and custom python version & installation commands. Leave `install_commands` empty (or omit it) to use the code-defined defaults; a non-empty list replaces those defaults. The optional `llm` mapping configures the model used by commit analysis and performance-test generation; explicit generation CLI values for `model_name`, `multiprocess`, `max_tokens`, `openai_timeout`, `stream`, and `extra_body` take precedence. Both analysis and generation default to non-stream responses; set `llm.stream: true` to enable streaming for all four LLM stages. Provider-specific request fields can be supplied through the generic `llm.extra_body` mapping and are passed unchanged to both transport modes. Generated performance tests default to `max_tokens: 32768` and `openai_timeout: 600` seconds. Transport failures are retried at most five times. The optional `llm.cache` mapping controls response caching for the `commit_filter`, `affected_files`, and `api_identification` analysis stages. All three stages default to `true`. Each value must be a YAML boolean. You can also specify `api_docs` and `repo_instr` (free form strings) to specify APIs to focus on during analysis and custom performance test generation tips. Generation uses YAML `install_commands` when configured; otherwise it uses the
 [default install commands](https://github.com/r2e-project/gso/blob/7b65c8fd7d41ae4d46e889d912e4fbc931871f39/src/gso/data/problem.py#L5-L6). See examples in the [experiments/](/exps/) directory.
 
 
