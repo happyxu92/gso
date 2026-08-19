@@ -64,9 +64,13 @@ WORKDIR /workspace
         self._lock = threading.Lock()
 
     @staticmethod
-    def create_workspace(problem, phase1_only: bool = False) -> Path:
+    def create_workspace(
+        problem, phase1_only: bool = False, test_timeout: int = 300
+    ) -> Path:
         # Docker and SkyPilot consume the same generated tests and phase scripts.
-        return SkyManager.create_workspace(problem, phase1_only=phase1_only)
+        return SkyManager.create_workspace(
+            problem, phase1_only=phase1_only, test_timeout=test_timeout
+        )
 
     def _platform_args(self) -> list[str]:
         return ["--platform", self.platform] if self.platform else []

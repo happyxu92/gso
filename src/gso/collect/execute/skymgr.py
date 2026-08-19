@@ -28,7 +28,13 @@ class SkyManager:
 
     @staticmethod
     def build_templates(
-        temp_dir, task, phase1, phase2, problem, phase1_only: bool = False
+        temp_dir,
+        task,
+        phase1,
+        phase2,
+        problem,
+        phase1_only: bool = False,
+        test_timeout: int = 300,
     ):
         setup_commands = "\n  ".join(problem.setup_commands)
         install_commands = ensure_patch_dependencies(
@@ -51,7 +57,9 @@ class SkyManager:
         )
 
         phase1 = phase1.safe_substitute(
-            repo_name=problem.repo.repo_name, install_commands=install_commands
+            repo_name=problem.repo.repo_name,
+            install_commands=install_commands,
+            test_timeout=test_timeout,
         )
 
         phase2 = phase2.safe_substitute(
@@ -61,6 +69,7 @@ class SkyManager:
             file_before="results_a.txt",
             file_after="results_b.txt",
             run_target_tests="false",
+            test_timeout=test_timeout,
         )
 
         with open(temp_dir / f"{problem.pid}_task.yaml", "w") as yaml_file:
@@ -73,7 +82,9 @@ class SkyManager:
             phase2_file.write(phase2)
 
     @staticmethod
-    def create_workspace(problem, phase1_only: bool = False) -> Path:
+    def create_workspace(
+        problem, phase1_only: bool = False, test_timeout: int = 300
+    ) -> Path:
         task = SkyManager.load_template(SKYGEN_TEMPLATE)
         phase1 = SkyManager.load_template(PHASE1_TEMPLATE)
         phase2 = SkyManager.load_template(PHASE2_TEMPLATE)
@@ -83,7 +94,13 @@ class SkyManager:
 
             # Create and write tamplates (task, phase1, phase2) to workspace
             SkyManager.build_templates(
-                temp_dir, task, phase1, phase2, problem, phase1_only=phase1_only
+                temp_dir,
+                task,
+                phase1,
+                phase2,
+                problem,
+                phase1_only=phase1_only,
+                test_timeout=test_timeout,
             )
 
             # each candidate commit is a subdirectory in the workspace

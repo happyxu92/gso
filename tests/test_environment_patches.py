@@ -72,3 +72,24 @@ def test_workspace_installs_dependencies_for_injected_patches():
         assert "import requests" in test
     finally:
         shutil.rmtree(workspace)
+
+
+def test_workspace_renders_configured_test_timeout(tmp_path):
+    problem = Problem(
+        pid="repo-api",
+        repo=Repo(
+            repo_url="https://github.com/example/repo",
+            repo_owner="example",
+            repo_name="repo",
+        ),
+        api="api",
+        py_version="3.12",
+        tests=[CommitTests(commit_hash="abcdef123456", samples=["print('test')"])],
+    )
+
+    workspace = SkyManager.create_workspace(problem, test_timeout=120)
+    try:
+        assert "timeout 120s python" in (workspace / "phase1.sh").read_text()
+        assert "timeout 120s python" in (workspace / "phase2.sh").read_text()
+    finally:
+        shutil.rmtree(workspace)

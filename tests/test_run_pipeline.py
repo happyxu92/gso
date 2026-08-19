@@ -34,6 +34,33 @@ def test_parse_args_uses_asset_template_and_300_commit_default():
         args.template == Path(__file__).resolve().parents[1] / "assets/experiment.yaml"
     )
     assert args.max_commits == 300
+    assert args.test_timeout == 300
+
+
+def test_pipeline_passes_test_timeout_to_execute_stage(tmp_path):
+    args = parse_args(["repositories.csv", "--test-timeout", "120"])
+    paths = compute_paths(tmp_path / "buckets")
+
+    stages = build_stages(
+        repo="demo",
+        exp_id="demo",
+        repo_checkout=tmp_path / "checkout",
+        config_path=tmp_path / "demo.yaml",
+        plots_dir=tmp_path / "plots",
+        args=args,
+        paths=paths,
+    )
+
+    execute_command = next(
+        command for name, command, _ in stages if name == "execute"
+    )
+    timeout_index = execute_command.index("--test-timeout")
+    assert execute_command[timeout_index + 1] == "120"
+
+
+def test_pipeline_rejects_non_positive_test_timeout():
+    with pytest.raises(SystemExit):
+        parse_args(["repositories.csv", "--test-timeout", "0"])
 
 
 def test_pipeline_evaluate_stage_builds_dataset(tmp_path):

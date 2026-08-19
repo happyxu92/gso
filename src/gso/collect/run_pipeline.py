@@ -34,6 +34,7 @@ Common options::
     --buckets-dir ~/buckets   relocate the GSO bucket
     --max-year 2022           commit year cutoff (analysis + generation)
     -n 5                      target tests per commit
+    --test-timeout 300        seconds allowed for each execute test invocation
     --api pkg.api             restrict generate/execute/evaluate to one API
     --api-key-envs KEY_1,KEY_2
                               rotate API key environment names across YAMLs
@@ -74,6 +75,7 @@ DEFAULT_MAX_YEAR = 2022
 DEFAULT_MAX_COMMITS = 300
 DEFAULT_TESTS_PER_COMMIT = 5
 DEFAULT_EXEC_MACHINES = 1
+DEFAULT_TEST_TIMEOUT = 300
 DEFAULT_CONCURRENCY = 3
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
@@ -106,6 +108,13 @@ _GENERATION_OUTPUT_PREFIXES = (
     _GENERATION_PROGRESS_PREFIX,
     _GENERATION_EVENT_PREFIX,
 )
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
 
 
 def timestamped(msg: str) -> str:
@@ -253,6 +262,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=float,
         default=None,
         help="execute.py status polling interval in seconds",
+    )
+    p.add_argument(
+        "--test-timeout",
+        type=_positive_int,
+        default=DEFAULT_TEST_TIMEOUT,
+        help=(
+            "timeout in seconds for each test invocation during execute "
+            f"(default: {DEFAULT_TEST_TIMEOUT})"
+        ),
     )
     p.add_argument(
         "--python",
@@ -610,6 +628,7 @@ def build_stages(
     if args.api:
         cmd += ["--api", args.api]
     cmd += docker_image_args + ["--machines", str(args.exec_machines)]
+    cmd += ["--test-timeout", str(args.test_timeout)]
     cmd += docker_common
     if args.poll_interval is not None:
         cmd += ["--poll-interval", str(args.poll_interval)]

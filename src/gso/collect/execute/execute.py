@@ -20,6 +20,52 @@ from gso.data import PerformanceCommit, Problem, Tests
 from gso.utils.io import load_problems, save_problems
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _completed_run_count(problem: Problem) -> int:
+    """Count prior runs that produced usable execution results."""
+    return sum(bool(results) for results in problem.results.values())
+
+
+def _reuse_existing_results(problems: list[Problem], results_path: Path) -> int:
+    """Copy successful results from a previous invocation onto current problems."""
+    if not results_path.exists():
+        return 0
+
+    existing_by_pid = {problem.pid: problem for problem in load_problems(results_path)}
+    reused_runs = 0
+    for problem in problems:
+        existing = existing_by_pid.get(problem.pid)
+        if existing is None:
+            continue
+        if (
+            existing.repo.repo_url != problem.repo.repo_url
+            or existing.api != problem.api
+        ):
+            print(
+                f"WARNING: not reusing results for {problem.pid}: "
+                "repository or API does not match",
+                flush=True,
+            )
+            continue
+
+        # Empty result groups represent failed/incomplete attempts. Excluding them
+        # makes a resumed invocation retry those runs and prevents a failed group
+        # from becoming the problem's first result set.
+        successful_results = {
+            key: results for key, results in existing.results.items() if results
+        }
+        problem.results = successful_results
+        reused_runs += len(successful_results)
+
+    return reused_runs
+
+
 @dataclass
 class TaskState:
     problem: Problem
@@ -78,6 +124,7 @@ class ExecutionManager:
         poll_interval: float = 5,
         keep_workspaces: bool = False,
         phase1_only: bool = False,
+        test_timeout: int = 300,
     ):
         if machines < 1:
             raise ValueError("machines must be at least 1")
@@ -87,6 +134,8 @@ class ExecutionManager:
             raise ValueError("interactive mode requires --machines 1")
         if poll_interval <= 0:
             raise ValueError("poll_interval must be greater than 0")
+        if test_timeout < 1:
+            raise ValueError("test_timeout must be at least 1")
 
         self.exp_id = exp_id
         self.exp_dir = exp_dir
@@ -99,6 +148,7 @@ class ExecutionManager:
         self.poll_interval = poll_interval
         self.keep_workspaces = keep_workspaces
         self.phase1_only = phase1_only
+        self.test_timeout = test_timeout
 
         self.cluster_counter = 0
         self.execution_id = uuid.uuid4().hex[:8]
@@ -122,15 +172,18 @@ class ExecutionManager:
             return name
 
     def initialize_problems(self) -> None:
-        """Create one isolated workspace for every problem/run combination."""
+        """Create workspaces only for problem runs not already completed."""
         errors = []
         for problem in self.problems:
-            for run_idx in range(self.runs):
+            completed_runs = _completed_run_count(problem)
+            for run_idx in range(completed_runs, self.runs):
                 cluster = self.get_next_cluster_name()
                 try:
                     workspace = Path(
                         self.runtime.create_workspace(
-                            problem, phase1_only=self.phase1_only
+                            problem,
+                            phase1_only=self.phase1_only,
+                            test_timeout=self.test_timeout,
                         )
                     )
                 except Exception as exc:
@@ -152,7 +205,7 @@ class ExecutionManager:
                 "Failed to create task workspace(s):\n" + "\n".join(errors)
             )
         if not self.tasks:
-            raise RuntimeError("No execution tasks were created")
+            raise RuntimeError("No pending execution tasks were created")
 
     def _result_key(self, state: TaskState) -> str:
         return f"{state.cluster}_run{state.run_index}"
@@ -619,9 +672,12 @@ async def async_main(
     keep_workspaces: bool = False,
     poll_interval: float | None = None,
     results_file: str | None = None,
+    test_timeout: int = 300,
 ) -> Path:
     if backend not in {"sky", "docker"}:
         raise ValueError("backend must be 'sky' or 'docker'")
+    if runs < 1:
+        raise ValueError("runs must be at least 1")
 
     exp_dir = EXPS_DIR / exp_id
     problems_path = exp_dir / f"{exp_id}_problems.json"
@@ -644,11 +700,32 @@ async def async_main(
     if not problems:
         raise ValueError(f"No problems found in {problems_path}")
 
-    validate_problem_test_samples(problems)
-
     results_path = resolve_results_path(
         exp_dir, exp_id, backend=backend, results_file=results_file
     )
+    reused_runs = _reuse_existing_results(problems, results_path)
+    pending_problems = [
+        problem for problem in problems if _completed_run_count(problem) < runs
+    ]
+    if reused_runs:
+        print(
+            f"Reusing {reused_runs} completed run(s); "
+            f"{len(pending_problems)}/{len(problems)} problem(s) still need execution",
+            flush=True,
+        )
+    if not pending_problems:
+        # Persist the normalized result set as well, so stale empty groups from
+        # failed attempts cannot be selected by downstream evaluation.
+        save_problems(results_path, problems)
+        print(
+            f"All {len(problems)} problem(s) already have {runs} completed run(s); "
+            f"results={results_path}",
+            flush=True,
+        )
+        return results_path
+
+    validate_problem_test_samples(pending_problems)
+
     if backend == "docker":
         image = docker_image or f"gso-{exp_id}:latest"
         runtime = DockerManager(
@@ -675,9 +752,10 @@ async def async_main(
         runtime = SkyManager()
         effective_poll_interval = 5 if poll_interval is None else poll_interval
 
-    runtime.validate(problems)
+    runtime.validate(pending_problems)
     print(
-        f"Executing {len(problems)} problem(s) with backend={backend}; "
+        f"Executing {len(pending_problems)}/{len(problems)} pending problem(s) "
+        f"with backend={backend}; "
         f"results={results_path}",
         flush=True,
     )
@@ -693,6 +771,7 @@ async def async_main(
         interactive=interactive,
         poll_interval=effective_poll_interval,
         keep_workspaces=keep_workspaces,
+        test_timeout=test_timeout,
     )
     manager.initialize_problems()
     await manager.run()
@@ -718,6 +797,7 @@ def main(
     keep_workspaces: bool = False,
     poll_interval: float | None = None,
     results_file: str | None = None,
+    test_timeout: int = 300,
 ) -> Path:
     return asyncio.run(
         async_main(
@@ -739,6 +819,7 @@ def main(
             keep_workspaces,
             poll_interval,
             results_file,
+            test_timeout,
         )
     )
 
@@ -818,6 +899,12 @@ if __name__ == "__main__":
         default=None,
         help="Status polling interval in seconds",
     )
+    parser.add_argument(
+        "--test-timeout",
+        type=_positive_int,
+        default=300,
+        help="Timeout in seconds for each test invocation (default: 300)",
+    )
     args = parser.parse_args()
 
     machines = args.machines
@@ -843,4 +930,5 @@ if __name__ == "__main__":
         args.keep_workspaces,
         args.poll_interval,
         args.results_file,
+        args.test_timeout,
     )
