@@ -6,6 +6,8 @@ import pytest
 
 from gso.collect.run_pipeline import (
     assign_api_key_envs,
+    build_stages,
+    compute_paths,
     normalize_api_key_envs,
     parse_args,
     prepare_workspace,
@@ -28,8 +30,30 @@ TIMESTAMP_RE = r"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+08:00\]"
 def test_parse_args_uses_asset_template_and_300_commit_default():
     args = parse_args(["repositories.csv"])
 
-    assert args.template == Path(__file__).resolve().parents[1] / "assets/experiment.yaml"
+    assert (
+        args.template == Path(__file__).resolve().parents[1] / "assets/experiment.yaml"
+    )
     assert args.max_commits == 300
+
+
+def test_pipeline_evaluate_stage_builds_dataset(tmp_path):
+    args = parse_args(["repositories.csv"])
+    paths = compute_paths(tmp_path / "buckets")
+
+    stages = build_stages(
+        repo="demo",
+        exp_id="demo",
+        repo_checkout=tmp_path / "checkout",
+        config_path=tmp_path / "demo.yaml",
+        plots_dir=tmp_path / "plots",
+        args=args,
+        paths=paths,
+    )
+
+    evaluate_command = next(
+        command for name, command, _ in stages if name == "evaluate"
+    )
+    assert "--build-dataset" in evaluate_command
 
 
 def test_timestamped_uses_beijing_iso_8601_time():

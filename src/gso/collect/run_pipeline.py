@@ -627,6 +627,7 @@ def build_stages(
         "commit",
         "--output-dir",
         str(plots_dir),
+        "--build-dataset",
     ]
     if args.api:
         cmd += ["--api", args.api]

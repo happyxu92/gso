@@ -158,12 +158,18 @@ python src/gso/collect/execute/evaluate.py \
 ### 5. Bulk pipeline across many repositories
 
 `run_pipeline.py` orchestrates the full collection workflow (commit analysis →
-API mapping → test generation → execution → evaluation) for every repository in
-a CSV list, running several repositories concurrently. Each repository gets its
-own workspace under `experiments/{repo}/` (an auto-generated `experiment.yaml`,
-run logs under `logs/`, and evaluation plots under `plots/`), while GSO-generated
-artifacts remain in the configurable GSO bucket (`~/buckets/gso_bucket` by
-default).
+API mapping → test generation → execution → evaluation/dataset build) for every
+repository in a CSV list, running several repositories concurrently. Each
+repository gets its own workspace under `experiments/{repo}/` (an auto-generated
+`experiment.yaml`, run logs under `logs/`, and evaluation plots under `plots/`),
+while GSO-generated artifacts remain in the configurable GSO bucket
+(`~/buckets/gso_bucket` by default).
+
+For each repository, the evaluation stage also selects `(pid, commit)` pairs
+whose measured speedup meets the dataset threshold, writes
+`experiments/{exp_id}/{exp_id}_pids.py` inside the bucket, and builds
+`datasets/gso_{exp_id}_dataset.jsonl`. If no pair meets the threshold, it logs
+that the PID export and dataset build were skipped.
 
 ```bash
 .venv/bin/python src/gso/collect/run_pipeline.py \
