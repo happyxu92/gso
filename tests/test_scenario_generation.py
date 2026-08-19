@@ -16,6 +16,8 @@ from gso.collect.generate.generate import (
     SEMANTIC_RETRY_COUNT,
     create_generation_problem,
     generate_commit_tests,
+    load_existing_problems,
+    save_problems_atomically,
 )
 from gso.collect.execute.execute import (
     GeneratedTestExecutionConfig,
@@ -113,6 +115,49 @@ def test_problem_uses_default_install_commands_when_not_configured():
         "uv pip install -e .",
         "uv pip install requests",
         "uv pip show repo",
+    ]
+
+
+def test_atomic_problem_save_preserves_existing_api_commit(tmp_path):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commits = [
+        PerformanceCommit(
+            commit_hash=f"{index}" * 16,
+            subject=f"Commit {index}",
+            message=f"Commit {index}",
+            date=f"2024-01-0{index}T00:00:00",
+        )
+        for index in (1, 2)
+    ]
+    problems = []
+    for commit in commits:
+        tests = CommitTests.from_commit(commit)
+        tests.add_sample(VALID_TEST)
+        problems.append(
+            Problem(
+                pid="repo-target",
+                repo=repo,
+                api="target",
+                commits=[commit],
+                tests=[tests],
+            )
+        )
+
+    path = tmp_path / "repo_problems.json"
+    save_problems_atomically(path, [problems[0]])
+    save_problems_atomically(path, [problems[1]])
+
+    saved = load_existing_problems(path)
+    assert len(saved) == 1
+    assert [commit.commit_hash for commit in saved[0].commits] == [
+        commit.commit_hash for commit in commits
+    ]
+    assert [tests.commit_hash for tests in saved[0].tests] == [
+        commit.commit_hash for commit in commits
     ]
 
 
@@ -779,16 +824,16 @@ def test_generator_skips_failed_commit_and_saves_successful_commit(
     saved = {}
     parallel_call = {}
 
-    def fake_run_tasks(function, tasks, **kwargs):
-        parallel_call.update(function=function, tasks=tasks, kwargs=kwargs)
-        return outputs
+    def fake_run_tasks(tasks, num_workers):
+        parallel_call.update(tasks=tasks, num_workers=num_workers)
+        return zip(tasks, outputs)
 
     monkeypatch.setattr(
         "gso.collect.generate.generate.prepare_generated_test_execution",
         lambda problems, config: None,
     )
     monkeypatch.setattr(
-        "gso.collect.generate.generate.run_tasks_in_parallel",
+        "gso.collect.generate.generate.generate_commits_as_completed",
         fake_run_tasks,
     )
     monkeypatch.setattr(
@@ -814,7 +859,235 @@ def test_generator_skips_failed_commit_and_saves_successful_commit(
     assert saved["path"] == tmp_path / "repo_problems.json"
     assert [task.target_index for task in parallel_call["tasks"]] == [0, 1]
     assert [task.target_count for task in parallel_call["tasks"]] == [2, 2]
-    assert parallel_call["kwargs"]["use_progress_bar"] is False
+    assert parallel_call["num_workers"] == 1
     assert len(saved["diagnostics"]) == 1
     assert saved["diagnostics"][0]["commit_hash"] == failed_commit.commit_hash
     assert saved["diagnostics"][0]["error"] == "commit setup failed"
+
+
+def test_generator_reuses_existing_api_commit_and_only_generates_missing_commit(
+    monkeypatch, tmp_path
+):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    existing_commit = PerformanceCommit(
+        commit_hash="1111111234567890",
+        subject="Already generated",
+        message="Already generated",
+        date="2024-01-01T00:00:00",
+    )
+    missing_commit = PerformanceCommit(
+        commit_hash="2222222234567890",
+        subject="Needs generation",
+        message="Needs generation",
+        date="2024-01-02T00:00:00",
+    )
+    existing_tests = CommitTests.from_commit(existing_commit)
+    existing_tests.add_sample(VALID_TEST)
+    results_path = tmp_path / "repo_problems.json"
+    save_problems_atomically(
+        results_path,
+        [
+            Problem(
+                pid="repo-target",
+                repo=repo,
+                api="target",
+                commits=[existing_commit],
+                tests=[existing_tests],
+            )
+        ],
+    )
+
+    generator = object.__new__(PerfExpGenerator)
+    generator.config = {"py_version": "3.12"}
+    generator.repo = repo
+    generator.candidates = {"target": [existing_commit, missing_commit]}
+    generator.exp_id = "repo"
+    generator.exp_dir = tmp_path
+    args = PerfExpGenArgs(yaml_path="unused.yaml", n=1, multiprocess=2)
+
+    missing_tests = CommitTests.from_commit(missing_commit)
+    missing_tests.add_sample(VALID_TEST)
+    generated_tasks = []
+
+    def fake_run_tasks(tasks, num_workers):
+        generated_tasks.extend(tasks)
+        assert num_workers == 1
+        yield tasks[0], SimpleNamespace(
+            is_success=lambda: True,
+            result=CommitGenerationResult(
+                problem_index=0,
+                commit_index=0,
+                pid="repo-target",
+                commit_hash=missing_commit.commit_hash,
+                commit_tests=missing_tests,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.prepare_generated_test_execution",
+        lambda problems, config: None,
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.generate_commits_as_completed",
+        fake_run_tasks,
+    )
+    monkeypatch.setattr(
+        generator,
+        "save_retry_diagnostics",
+        lambda diagnostics, args: None,
+    )
+
+    problems = generator.gen(args)
+
+    assert [task.commit.commit_hash for task in generated_tasks] == [
+        missing_commit.commit_hash
+    ]
+    assert len(problems) == 1
+    assert [commit.commit_hash for commit in problems[0].commits] == [
+        existing_commit.commit_hash,
+        missing_commit.commit_hash,
+    ]
+    persisted = load_existing_problems(results_path)
+    assert [commit.commit_hash for commit in persisted[0].commits] == [
+        existing_commit.commit_hash,
+        missing_commit.commit_hash,
+    ]
+
+
+def test_generator_does_not_prepare_docker_when_all_api_commits_exist(
+    monkeypatch, tmp_path
+):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commit = PerformanceCommit(
+        commit_hash="1111111234567890",
+        subject="Already generated",
+        message="Already generated",
+        date="2024-01-01T00:00:00",
+    )
+    tests = CommitTests.from_commit(commit)
+    tests.add_sample(VALID_TEST)
+    existing_problem = Problem(
+        pid="repo-target",
+        repo=repo,
+        api="target",
+        commits=[commit],
+        tests=[tests],
+    )
+    save_problems_atomically(tmp_path / "repo_problems.json", [existing_problem])
+
+    generator = object.__new__(PerfExpGenerator)
+    generator.config = {"py_version": "3.12"}
+    generator.repo = repo
+    generator.candidates = {"target": [commit]}
+    generator.exp_id = "repo"
+    generator.exp_dir = tmp_path
+    args = PerfExpGenArgs(yaml_path="unused.yaml", n=1, multiprocess=1)
+
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.prepare_generated_test_execution",
+        lambda *args: pytest.fail("Docker preparation should be skipped"),
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.generate_commits_as_completed",
+        lambda *args: pytest.fail("Generation should be skipped"),
+    )
+
+    assert generator.gen(args) == [existing_problem]
+
+
+def test_generator_persists_each_commit_before_receiving_the_next(
+    monkeypatch, tmp_path
+):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commits = [
+        PerformanceCommit(
+            commit_hash="1111111234567890",
+            subject="First generation",
+            message="First generation",
+            date="2024-01-01T00:00:00",
+        ),
+        PerformanceCommit(
+            commit_hash="2222222234567890",
+            subject="Second generation",
+            message="Second generation",
+            date="2024-01-02T00:00:00",
+        ),
+    ]
+    generator = object.__new__(PerfExpGenerator)
+    generator.config = {"py_version": "3.12"}
+    generator.repo = repo
+    generator.candidates = {"target": commits}
+    generator.exp_id = "repo"
+    generator.exp_dir = tmp_path
+    args = PerfExpGenArgs(yaml_path="unused.yaml", n=1, multiprocess=2)
+
+    outputs = []
+    for commit_index, commit in enumerate(commits):
+        tests = CommitTests.from_commit(commit)
+        tests.add_sample(VALID_TEST)
+        outputs.append(
+            SimpleNamespace(
+                is_success=lambda: True,
+                result=CommitGenerationResult(
+                    problem_index=0,
+                    commit_index=commit_index,
+                    pid="repo-target",
+                    commit_hash=commit.commit_hash,
+                    commit_tests=tests,
+                ),
+            )
+        )
+
+    saved_commit_hashes = []
+
+    def fake_save(_path, problems):
+        saved_commit_hashes.append(
+            [commit.commit_hash for problem in problems for commit in problem.commits]
+        )
+
+    def fake_run_tasks(tasks, _num_workers):
+        yield tasks[0], outputs[0]
+        assert saved_commit_hashes == [[commits[0].commit_hash]]
+        yield tasks[1], outputs[1]
+
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.prepare_generated_test_execution",
+        lambda problems, config: None,
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.generate_commits_as_completed",
+        fake_run_tasks,
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.validate_problem_test_samples",
+        lambda problems: None,
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.save_problems_atomically",
+        fake_save,
+    )
+    monkeypatch.setattr(
+        generator,
+        "save_retry_diagnostics",
+        lambda diagnostics, args: None,
+    )
+
+    problems = generator.gen(args)
+
+    assert saved_commit_hashes == [
+        [commits[0].commit_hash],
+        [commit.commit_hash for commit in commits],
+    ]
+    assert problems[0].commits == commits

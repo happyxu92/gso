@@ -1,16 +1,18 @@
 import json
+import multiprocessing as mp
 import os
-import shutil
 import tempfile
 import time
 import traceback
+from concurrent.futures import as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import fire
+from pebble import ProcessPool
 
-from r2e.multiprocess import run_tasks_in_parallel
+from r2e.multiprocess import TaskResult, TaskRunStatus
 from gso.data import PerformanceCommit, Problem, Repo, Tests
 from gso.logger import logger
 from gso.constants import (
@@ -472,8 +474,81 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
     return result
 
 
+def generate_commits_as_completed(tasks: list[CommitGenerationTask], num_workers: int):
+    """Yield each task result as soon as its worker finishes."""
+    with ProcessPool(
+        max_workers=num_workers,
+        context=mp.get_context("spawn"),
+    ) as pool:
+        future_tasks = {
+            pool.schedule(generate_commit_tests, args=[task]): task for task in tasks
+        }
+        for future in as_completed(future_tasks):
+            task = future_tasks[future]
+            try:
+                result = future.result()
+            except Exception:
+                yield task, TaskResult(
+                    status=TaskRunStatus.EXCEPTION,
+                    exception_tb=traceback.format_exc(),
+                )
+            else:
+                yield task, TaskResult(
+                    status=TaskRunStatus.SUCCESS,
+                    result=result,
+                )
+
+
+def load_existing_problems(path: Path) -> list[Problem]:
+    """Load a reusable problems snapshot, rejecting an invalid top-level shape."""
+    if not path.exists():
+        return []
+
+    existing_data = load_json(path)
+    if not isinstance(existing_data, list):
+        raise ValueError(f"Existing problems file is not a JSON list: {path}")
+    return [Problem(**problem) for problem in existing_data]
+
+
+def merge_generated_problems(
+    existing_problems: list[Problem], new_problems: list[Problem]
+) -> list[Problem]:
+    """Merge problem snapshots without replacing existing API/commit results."""
+    merged_problems = [problem.model_copy(deep=True) for problem in existing_problems]
+    problem_indexes = {
+        problem.api: problem_index
+        for problem_index, problem in enumerate(merged_problems)
+    }
+
+    for new_problem in new_problems:
+        problem_index = problem_indexes.get(new_problem.api)
+        if problem_index is None:
+            problem_indexes[new_problem.api] = len(merged_problems)
+            merged_problems.append(new_problem.model_copy(deep=True))
+            continue
+
+        merged_problem = merged_problems[problem_index]
+        existing_commit_hashes = {
+            commit.commit_hash for commit in merged_problem.commits
+        }
+        merged_problem.commits.extend(
+            commit.model_copy(deep=True)
+            for commit in new_problem.commits
+            if commit.commit_hash not in existing_commit_hashes
+        )
+
+        existing_test_hashes = {tests.commit_hash for tests in merged_problem.tests}
+        merged_problem.tests.extend(
+            tests.model_copy(deep=True)
+            for tests in new_problem.tests
+            if tests.commit_hash not in existing_test_hashes
+        )
+
+    return merged_problems
+
+
 def save_problems_atomically(path: Path, problems: list[Problem]) -> None:
-    """Merge generated problems and atomically replace the destination JSON."""
+    """Merge API/commit results and atomically replace the destination JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
     file_descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -481,15 +556,39 @@ def save_problems_atomically(path: Path, problems: list[Problem]) -> None:
     os.close(file_descriptor)
     temporary_path = Path(temporary_name)
     try:
-        if path.exists():
-            existing_data = load_json(path)
-            if not isinstance(existing_data, list):
-                raise ValueError(f"Existing problems file is not a JSON list: {path}")
-            shutil.copyfile(path, temporary_path)
-        save_problems(temporary_path, problems)
+        existing_problems = load_existing_problems(path)
+        merged_problems = merge_generated_problems(existing_problems, problems)
+        save_problems(temporary_path, merged_problems)
         os.replace(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def build_generated_problems(
+    problems: list[Problem],
+    generated_by_commit: dict[tuple[int, int], Tests],
+) -> list[Problem]:
+    """Build a persistable snapshot from the commit results received so far."""
+    generated_problems = []
+    for problem_index, source_problem in enumerate(problems):
+        successful_commit_entries = [
+            (commit_index, generated_by_commit[(problem_index, commit_index)])
+            for commit_index in range(source_problem.num_commits())
+            if (problem_index, commit_index) in generated_by_commit
+        ]
+        if not successful_commit_entries:
+            continue
+
+        problem = source_problem.model_copy(deep=True)
+        problem.commits = [
+            source_problem.commits[commit_index]
+            for commit_index, _ in successful_commit_entries
+        ]
+        problem.set_tests(
+            [commit_tests for _, commit_tests in successful_commit_entries]
+        )
+        generated_problems.append(problem)
+    return generated_problems
 
 
 class PerfExpGenerator:
@@ -641,6 +740,9 @@ class PerfExpGenerator:
     def gen(self, args) -> list[Problem]:
         logger.debug(f"Generating perftests: {self.repo}")
 
+        results_json = f"{self.exp_id}_problems{'_DEBUG' if DEBUG_FLAG else ''}.json"
+        results_path = self.exp_dir / results_json
+
         problems = [
             create_generation_problem(self.repo, api, commits, self.config)
             for api, commits in self.candidates.items()
@@ -666,6 +768,33 @@ class PerfExpGenerator:
         problems = [problem for problem in problems if problem.num_commits() > 0]
         if not problems:
             raise ValueError("No candidate commits remain after generation filters")
+
+        existing_problems = load_existing_problems(results_path)
+        existing_api_commits = {
+            (problem.api, commit.commit_hash)
+            for problem in existing_problems
+            for commit in problem.commits
+        }
+        skipped_commit_count = 0
+        for problem in problems:
+            candidate_count = problem.num_commits()
+            problem.commits = [
+                commit
+                for commit in problem.commits
+                if (problem.api, commit.commit_hash) not in existing_api_commits
+            ]
+            skipped_commit_count += candidate_count - problem.num_commits()
+        problems = [problem for problem in problems if problem.num_commits() > 0]
+
+        if skipped_commit_count:
+            print(
+                f"Reusing {skipped_commit_count} existing API/commit result(s) "
+                f"from {results_path}",
+                flush=True,
+            )
+        if not problems:
+            print("All candidate API/commit results already exist; nothing to generate")
+            return existing_problems
 
         commit_tasks = [
             CommitGenerationTask(
@@ -721,24 +850,15 @@ class PerfExpGenerator:
             f"commit_workers={commit_workers}, max_tokens={args.max_tokens}, "
             f"stream={args.stream})"
         )
-        generation_outputs = run_tasks_in_parallel(
-            generate_commit_tests,
-            commit_tasks,
-            use_progress_bar=False,
-            num_workers=commit_workers,
-        )
+        generation_outputs = generate_commits_as_completed(commit_tasks, commit_workers)
 
         generation_errors = []
         failure_diagnostics = []
         retry_diagnostics = []
         generated_by_commit: dict[tuple[int, int], Tests] = {}
-        if len(generation_outputs) != len(commit_tasks):
-            generation_errors.append(
-                f"expected {len(commit_tasks)} commit result(s), "
-                f"got {len(generation_outputs)}"
-            )
-
-        for task, output in zip(commit_tasks, generation_outputs):
+        received_output_count = 0
+        for task, output in generation_outputs:
+            received_output_count += 1
             task_label = f"{task.problem.pid}/{task.commit.quick_hash()}"
             if not output.is_success():
                 error = output.exception_tb or f"worker status: {output.status}"
@@ -799,27 +919,31 @@ class PerfExpGenerator:
                 continue
             generated_by_commit[key] = commit_result.commit_tests
 
-        generated_problems = []
+            # Persist every completed API/commit immediately. The snapshot contains
+            # all successful commits received so far, while the atomic replacement
+            # keeps the existing JSON file valid if generation is interrupted.
+            generated_problems = build_generated_problems(problems, generated_by_commit)
+            validate_problem_test_samples(generated_problems)
+            save_problems_atomically(results_path, generated_problems)
+            print(
+                f"Saved completed API/commit {task_label} to {results_path} "
+                f"({len(generated_by_commit)}/{len(commit_tasks)})",
+                flush=True,
+            )
+
+        if received_output_count != len(commit_tasks):
+            generation_errors.append(
+                f"expected {len(commit_tasks)} commit result(s), "
+                f"got {received_output_count}"
+            )
+
+        generated_problems = build_generated_problems(problems, generated_by_commit)
         for problem_index, problem in enumerate(problems):
-            successful_commit_entries = [
-                (commit_index, generated_by_commit[(problem_index, commit_index)])
-                for commit_index in range(problem.num_commits())
-                if (problem_index, commit_index) in generated_by_commit
-            ]
-            if not successful_commit_entries:
+            if not any(key[0] == problem_index for key in generated_by_commit):
                 logger.error(
                     "%s: no commits produced valid generated tests; skipping problem",
                     problem.pid,
                 )
-                continue
-            problem.commits = [
-                problem.commits[commit_index]
-                for commit_index, _ in successful_commit_entries
-            ]
-            problem.set_tests(
-                [commit_tests for _, commit_tests in successful_commit_entries]
-            )
-            generated_problems.append(problem)
 
         if not generated_problems:
             displayed_errors = generation_errors[:20]
@@ -852,16 +976,12 @@ class PerfExpGenerator:
             )
 
         validate_problem_test_samples(generated_problems)
-
-        results_json = f"{self.exp_id}_problems{'_DEBUG' if DEBUG_FLAG else ''}.json"
-        results_path = self.exp_dir / results_json
-        save_problems_atomically(results_path, generated_problems)
         print(f"Saved validated generated problems to {results_path}")
         diagnostic_outputs = [*retry_diagnostics, *failure_diagnostics]
         retry_path = self.save_retry_diagnostics(diagnostic_outputs, args)
         if retry_path is not None:
             print(f"Saved generation retry/failure diagnostics to {retry_path}")
-        return generated_problems
+        return merge_generated_problems(existing_problems, generated_problems)
 
 
 if __name__ == "__main__":
