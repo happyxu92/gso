@@ -9,15 +9,18 @@ from r2e.llms.llm_args import LLMArgs
 
 from gso.collect.generate.args import PerfExpGenArgs
 from gso.collect.generate.generate import (
+    API_PREFLIGHT_RESULT_PREFIX,
     CommitGenerationResult,
     CommitGenerationTask,
     GENERATION_EVENT_PREFIX,
     GENERATION_PROGRESS_PREFIX,
     PerfExpGenerator,
     SEMANTIC_RETRY_COUNT,
+    build_api_preflight_test,
     create_generation_problem,
     generate_commit_tests,
     load_existing_problems,
+    preflight_generation_problems,
     request_install_commands_from_codex,
     save_problems_atomically,
     update_yaml_install_commands,
@@ -119,6 +122,147 @@ def test_problem_uses_default_install_commands_when_not_configured():
         "uv pip install requests",
         "uv pip show repo",
     ]
+
+
+def test_api_preflight_test_resolves_qualified_and_exported_apis(capsys):
+    namespace = {}
+    source = build_api_preflight_test(["json.dumps", "dumps"], "json")
+
+    exec(compile(source, "<api-preflight>", "exec"), namespace)
+    results = namespace["experiment"]()
+
+    assert results["json.dumps"]["ok"] is True
+    assert results["dumps"]["ok"] is True
+    assert API_PREFLIGHT_RESULT_PREFIX in capsys.readouterr().out
+
+
+def test_preflight_skips_only_unresolved_api_in_shared_commit_group(monkeypatch):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commit = PerformanceCommit(
+        commit_hash="1111111234567890",
+        subject="Optimize APIs",
+        message="Optimize APIs",
+        date="2024-01-01T00:00:00",
+    )
+    problems = [
+        Problem(pid="repo-good", repo=repo, api="good", commits=[commit]),
+        Problem(pid="repo-bad", repo=repo, api="bad", commits=[commit]),
+    ]
+    report = {
+        "good": {"ok": True, "resolved": "repo.good"},
+        "bad": {"ok": False, "error": "ImportError: missing API"},
+    }
+    calls = []
+
+    def fake_evaluate(problem, checked_commit, test, config):
+        calls.append((problem, checked_commit, test, config))
+        return GeneratedTestExecutionResult(
+            passed=False,
+            error=(
+                "execution failed\n"
+                + API_PREFLIGHT_RESULT_PREFIX
+                + json.dumps(report, separators=(",", ":"))
+                + "\ntraceback"
+            ),
+        )
+
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.evaluate_generated_test", fake_evaluate
+    )
+    config = GeneratedTestExecutionConfig(exp_id="repo")
+
+    accepted, diagnostics = preflight_generation_problems(problems, config)
+
+    assert [problem.api for problem in accepted] == ["good"]
+    assert len(calls) == 1
+    assert "good" in calls[0][2]
+    assert "bad" in calls[0][2]
+    assert diagnostics == [
+        {
+            "pid": "repo-bad",
+            "api": "bad",
+            "commit_hash": commit.commit_hash,
+            "stage": "install_api_preflight",
+            "error": "ImportError: missing API",
+        }
+    ]
+
+
+def test_preflight_skips_commit_group_when_install_fails(monkeypatch):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commit = PerformanceCommit(
+        commit_hash="1111111234567890",
+        subject="Optimize API",
+        message="Optimize API",
+        date="2024-01-01T00:00:00",
+    )
+    problem = Problem(pid="repo-target", repo=repo, api="target", commits=[commit])
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.evaluate_generated_test",
+        lambda *args: GeneratedTestExecutionResult(
+            passed=False, error="install command exited with status 1"
+        ),
+    )
+
+    accepted, diagnostics = preflight_generation_problems(
+        [problem], GeneratedTestExecutionConfig(exp_id="repo")
+    )
+
+    assert accepted == []
+    assert diagnostics[0]["api"] == "target"
+    assert diagnostics[0]["error"] == "install command exited with status 1"
+
+
+def test_preflight_rejects_api_when_a_later_candidate_commit_fails(monkeypatch):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commits = [
+        PerformanceCommit(
+            commit_hash="1111111234567890",
+            subject="First optimization",
+            message="First optimization",
+            date="2024-01-01T00:00:00",
+        ),
+        PerformanceCommit(
+            commit_hash="2222222234567890",
+            subject="Second optimization",
+            message="Second optimization",
+            date="2024-01-02T00:00:00",
+        ),
+    ]
+    problem = Problem(pid="repo-target", repo=repo, api="target", commits=commits)
+    checked_hashes = []
+
+    def fake_evaluate(_problem, commit, _test, _config):
+        checked_hashes.append(commit.commit_hash)
+        if commit == commits[0]:
+            return GeneratedTestExecutionResult(passed=True)
+        return GeneratedTestExecutionResult(
+            passed=False, error="API is unavailable on this parent commit"
+        )
+
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.evaluate_generated_test", fake_evaluate
+    )
+
+    accepted, diagnostics = preflight_generation_problems(
+        [problem], GeneratedTestExecutionConfig(exp_id="repo")
+    )
+
+    assert accepted == []
+    assert checked_hashes == [commit.commit_hash for commit in commits]
+    assert diagnostics[0]["commit_hash"] == commits[1].commit_hash
 
 
 def test_codex_install_command_inference_uses_local_repo_and_schema(

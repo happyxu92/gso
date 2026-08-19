@@ -50,6 +50,7 @@ DEFAULT_GENERATION_LLM_CACHE_SETTINGS = {
 }
 GENERATION_PROGRESS_PREFIX = "Generation progress:"
 GENERATION_EVENT_PREFIX = "Generation event:"
+API_PREFLIGHT_RESULT_PREFIX = "GSO_API_PREFLIGHT_RESULTS="
 CODEX_INSTALL_COMMAND_TIMEOUT_SECONDS = 600
 CODEX_INSTALL_COMMAND_SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
@@ -220,6 +221,308 @@ def create_generation_problem(
 ) -> Problem:
     """Create a problem using configured install commands or model defaults."""
     return Problem.create_prob(repo, api, commits, config)
+
+
+def build_api_preflight_test(apis: list[str], repo_name: str) -> str:
+    """Build a smoke test that imports and resolves each requested Python API.
+
+    API analysis sometimes records a fully qualified name (``numpy.asarray``),
+    but it can also record a class method without its module
+    (``DataFrame.dropna``). The embedded resolver first tries qualified imports,
+    then exported attributes from the installed distribution, and finally scans
+    its sources before importing modules that define the recorded API.
+    """
+    apis_json = json.dumps(apis, ensure_ascii=False)
+    repo_name_json = json.dumps(repo_name)
+    prefix_json = json.dumps(API_PREFLIGHT_RESULT_PREFIX)
+    return f'''import ast
+import importlib
+import importlib.metadata
+import json
+import timeit
+from pathlib import Path
+
+TARGET_APIS = {apis_json}
+REPO_NAME = {repo_name_json}
+RESULT_PREFIX = {prefix_json}
+ALIASES = {{
+    "np": "numpy",
+    "pd": "pandas",
+    "plt": "matplotlib.pyplot",
+    "tf": "tensorflow",
+    "torch": "torch",
+}}
+
+
+def _normalize_distribution_name(name):
+    return name.lower().replace("-", "_").replace(".", "_")
+
+
+def _getattr_chain(value, attributes):
+    for attribute in attributes:
+        value = getattr(value, attribute)
+    return value
+
+
+def _repository_roots():
+    normalized_repo = _normalize_distribution_name(REPO_NAME)
+    roots = {{normalized_repo}}
+    try:
+        distributions = importlib.metadata.packages_distributions()
+    except Exception:
+        distributions = {{}}
+    for package, names in distributions.items():
+        if any(_normalize_distribution_name(name) == normalized_repo for name in names):
+            roots.add(package)
+
+    repo_path = Path("/workspace") / REPO_NAME
+    if repo_path.is_dir():
+        for package_parent in (repo_path, repo_path / "src"):
+            if not package_parent.is_dir():
+                continue
+            for child in package_parent.iterdir():
+                if child.is_dir() and (child / "__init__.py").is_file():
+                    roots.add(child.name)
+    return sorted(roots)
+
+
+def _module_defines_api(source_path, api_root):
+    try:
+        tree = ast.parse(source_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return False
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == api_root:
+                return True
+        elif isinstance(node, ast.Assign):
+            if any(isinstance(target, ast.Name) and target.id == api_root for target in node.targets):
+                return True
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == api_root:
+                return True
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if any((alias.asname or alias.name.split(".")[-1]) == api_root for alias in node.names):
+                return True
+    return False
+
+
+def _candidate_modules(root_module, api_root):
+    candidates = []
+    for raw_package_path in getattr(root_module, "__path__", []):
+        package_path = Path(raw_package_path)
+        for source_path in package_path.rglob("*.py"):
+            if source_path.name == "__main__.py":
+                continue
+            if not _module_defines_api(source_path, api_root):
+                continue
+            relative = source_path.relative_to(package_path)
+            suffix_parts = list(relative.with_suffix("").parts)
+            if suffix_parts[-1] == "__init__":
+                suffix_parts.pop()
+            module_name = ".".join([root_module.__name__, *suffix_parts])
+            candidates.append(module_name)
+    return sorted(set(candidates), key=lambda name: (name.count("."), name))
+
+
+def _resolve_api(api):
+    parts = api.split(".")
+    errors = []
+
+    alias_module = ALIASES.get(parts[0])
+    if alias_module is not None:
+        try:
+            return _getattr_chain(importlib.import_module(alias_module), parts[1:])
+        except (Exception, SystemExit) as error:
+            errors.append(f"{{alias_module}}: {{type(error).__name__}}: {{error}}")
+
+    for split_index in range(len(parts), 0, -1):
+        module_name = ".".join(parts[:split_index])
+        try:
+            module = importlib.import_module(module_name)
+            return _getattr_chain(module, parts[split_index:])
+        except (Exception, SystemExit) as error:
+            errors.append(f"{{module_name}}: {{type(error).__name__}}: {{error}}")
+
+    roots = _repository_roots()
+    for root_name in roots:
+        try:
+            root_module = importlib.import_module(root_name)
+            return _getattr_chain(root_module, parts)
+        except (Exception, SystemExit) as error:
+            errors.append(f"{{root_name}}: {{type(error).__name__}}: {{error}}")
+            try:
+                root_module = importlib.import_module(root_name)
+            except (Exception, SystemExit):
+                continue
+
+        for module_name in _candidate_modules(root_module, parts[0]):
+            try:
+                module = importlib.import_module(module_name)
+                return _getattr_chain(module, parts)
+            except (Exception, SystemExit):
+                continue
+
+    detail = "; ".join(errors[-8:])
+    raise ImportError(
+        f"could not resolve {{api!r}} from repository distribution roots {{roots}}"
+        + (f"; recent errors: {{detail}}" if detail else "")
+    )
+
+
+def setup():
+    return None
+
+
+def experiment():
+    results = {{}}
+    for api in TARGET_APIS:
+        try:
+            value = _resolve_api(api)
+            results[api] = {{
+                "ok": True,
+                "resolved": f"{{getattr(value, '__module__', '')}}."
+                f"{{getattr(value, '__qualname__', getattr(value, '__name__', ''))}}",
+            }}
+        except (Exception, SystemExit) as error:
+            message = f"{{type(error).__name__}}: {{error}}"
+            results[api] = {{"ok": False, "error": message[-160:]}}
+    print(RESULT_PREFIX + json.dumps(results, separators=(",", ":")), flush=True)
+    failures = [api for api, result in results.items() if not result["ok"]]
+    if failures:
+        raise RuntimeError("API reference preflight failed: " + ", ".join(failures))
+    return results
+
+
+def store_result(result, path):
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(result, file)
+
+
+def load_result(path):
+    with open(path, encoding="utf-8") as file:
+        return json.load(file)
+
+
+def check_equivalence(reference, current):
+    assert reference == current
+
+
+def run_test(eqcheck=False, reference=False, prefix=""):
+    setup()
+    execution_time, result = timeit.timeit(experiment, number=1)
+    result_path = f"{{prefix}}_api_preflight.json"
+    if reference:
+        store_result(result, result_path)
+    elif eqcheck:
+        check_equivalence(load_result(result_path), result)
+    return execution_time
+'''
+
+
+def _parse_api_preflight_results(error: str | None) -> dict[str, dict] | None:
+    """Extract the compact per-API report printed by a failed smoke test."""
+    if not error:
+        return None
+    marker_index = error.rfind(API_PREFLIGHT_RESULT_PREFIX)
+    if marker_index < 0:
+        return None
+    report = error[marker_index + len(API_PREFLIGHT_RESULT_PREFIX) :].splitlines()[0]
+    try:
+        parsed = json.loads(report)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def preflight_generation_problems(
+    problems: list[Problem],
+    config: GeneratedTestExecutionConfig | None,
+) -> tuple[list[Problem], list[dict]]:
+    """Verify installation and API references before spending LLM requests.
+
+    APIs sharing a candidate commit are checked in one container, so their common
+    install commands run only once. Every API is checked against all of its
+    remaining candidate commits. A missing structured report means setup failed
+    before Python could run, in which case the whole commit group is skipped.
+    Otherwise only APIs reported as unresolved are skipped.
+    """
+    if config is None:
+        return problems, []
+
+    groups: dict[str, tuple[PerformanceCommit, list[Problem]]] = {}
+    for problem in problems:
+        for commit in problem.commits:
+            _, grouped_problems = groups.setdefault(
+                commit.commit_hash, (commit, [])
+            )
+            grouped_problems.append(problem)
+
+    accepted_apis = {problem.api for problem in problems}
+    diagnostics: list[dict] = []
+    for commit, original_grouped_problems in groups.values():
+        grouped_problems = [
+            problem
+            for problem in original_grouped_problems
+            if problem.api in accepted_apis
+        ]
+        if not grouped_problems:
+            continue
+        representative = grouped_problems[0]
+        apis = [problem.api for problem in grouped_problems]
+        print(
+            f"Preflighting install commands and {len(apis)} API reference(s) "
+            f"on {commit.quick_hash()}...",
+            flush=True,
+        )
+        test = build_api_preflight_test(apis, representative.repo.repo_name)
+        passed = False
+        try:
+            result = evaluate_generated_test(representative, commit, test, config)
+        except Exception as error:
+            result_error = f"{type(error).__name__}: {error}"
+            report = None
+        else:
+            passed = result.passed
+            result_error = result.error
+            report = _parse_api_preflight_results(result.error)
+
+        if passed:
+            accepted_apis.update(apis)
+            print(
+                f"API preflight passed for {len(apis)} API(s) on "
+                f"{commit.quick_hash()}",
+                flush=True,
+            )
+            continue
+
+        for api in apis:
+            api_report = report.get(api) if report is not None else None
+            if isinstance(api_report, dict) and api_report.get("ok") is True:
+                continue
+            error = (
+                (api_report.get("error") or result_error)
+                if isinstance(api_report, dict)
+                else result_error
+            )
+            error = error or "install/API preflight failed without diagnostics"
+            accepted_apis.discard(api)
+            diagnostics.append(
+                {
+                    "pid": next(
+                        problem.pid for problem in grouped_problems if problem.api == api
+                    ),
+                    "api": api,
+                    "commit_hash": commit.commit_hash,
+                    "stage": "install_api_preflight",
+                    "error": error,
+                }
+            )
+            logger.error("Skipping API %s after preflight failure: %s", api, error)
+
+    return [problem for problem in problems if problem.api in accepted_apis], diagnostics
 
 
 @dataclass(frozen=True)
@@ -993,29 +1296,6 @@ class PerfExpGenerator:
             print("All candidate API/commit results already exist; nothing to generate")
             return existing_problems
 
-        commit_tasks = [
-            CommitGenerationTask(
-                problem_index=problem_index,
-                commit_index=commit_index,
-                repo=self.repo,
-                problem=problem,
-                commit=commit,
-                args=args,
-            )
-            for problem_index, problem in enumerate(problems)
-            for commit_index, commit in enumerate(problem.commits)
-        ]
-        if not commit_tasks:
-            raise RuntimeError("No commit generation tasks were prepared")
-        commit_tasks = [
-            replace(
-                task,
-                target_index=target_index,
-                target_count=len(commit_tasks),
-            )
-            for target_index, task in enumerate(commit_tasks)
-        ]
-
         repo_path = args.docker_repo_path
         if repo_path is None:
             analyzed_repo = ANALYSIS_REPOS_DIR / self.repo.repo_name
@@ -1036,8 +1316,45 @@ class PerfExpGenerator:
                 keep_workspaces=args.keep_workspaces,
             ),
         )
+        problems, preflight_diagnostics = preflight_generation_problems(
+            problems, execution_config
+        )
+        if not problems:
+            retry_path = self.save_retry_diagnostics(preflight_diagnostics, args)
+            detail = (
+                f" Diagnostics were saved to {retry_path}."
+                if retry_path is not None
+                else ""
+            )
+            print(
+                "No APIs passed install/import preflight; nothing to generate."
+                + detail,
+                flush=True,
+            )
+            return existing_problems
+
         commit_tasks = [
-            replace(task, execution_config=execution_config) for task in commit_tasks
+            CommitGenerationTask(
+                problem_index=problem_index,
+                commit_index=commit_index,
+                repo=self.repo,
+                problem=problem,
+                commit=commit,
+                args=args,
+            )
+            for problem_index, problem in enumerate(problems)
+            for commit_index, commit in enumerate(problem.commits)
+        ]
+        if not commit_tasks:
+            raise RuntimeError("No commit generation tasks were prepared")
+        commit_tasks = [
+            replace(
+                task,
+                target_index=target_index,
+                target_count=len(commit_tasks),
+                execution_config=execution_config,
+            )
+            for target_index, task in enumerate(commit_tasks)
         ]
 
         commit_workers = min(args.multiprocess, len(commit_tasks))
@@ -1050,7 +1367,7 @@ class PerfExpGenerator:
         generation_outputs = generate_commits_as_completed(commit_tasks, commit_workers)
 
         generation_errors = []
-        failure_diagnostics = []
+        failure_diagnostics = list(preflight_diagnostics)
         retry_diagnostics = []
         generated_by_commit: dict[tuple[int, int], Tests] = {}
         received_output_count = 0
