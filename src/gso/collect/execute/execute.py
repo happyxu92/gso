@@ -100,6 +100,7 @@ class GeneratedTestExecutionConfig:
     keep_workspaces: bool = False
     poll_interval: float | None = None
     phase1_only: bool = True
+    prepared_commit_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -388,9 +389,7 @@ class ExecutionManager:
             # signature) by inspecting the retained layout, so announce where it
             # lives instead of leaving it as an anonymous tempdir to find.
             for state in self.tasks.values():
-                quick_hashes = ",".join(
-                    test.quick_hash for test in state.problem.tests
-                )
+                quick_hashes = ",".join(test.quick_hash for test in state.problem.tests)
                 print(
                     f"Kept workspace for {state.problem.pid} "
                     f"(commit(s) {quick_hashes}, run {state.run_index + 1}): "
@@ -483,10 +482,52 @@ def _create_runtime(config: GeneratedTestExecutionConfig, exp_dir: Path):
                 if config.docker_cache_dir
                 else exp_dir / "docker_cache"
             ),
+            prepared_commit_hash=config.prepared_commit_hash,
         )
     if config.backend == "sky":
         return SkyManager()
     raise ValueError("backend must be 'sky' or 'docker'")
+
+
+def prepare_commit_test_execution(
+    problem: Problem,
+    commit: PerformanceCommit,
+    config: GeneratedTestExecutionConfig,
+    *,
+    session_id: str,
+) -> GeneratedTestExecutionConfig:
+    """Install one candidate parent revision into an immutable Docker image."""
+    if config.backend != "docker":
+        raise ValueError("Prepared commit environments currently require Docker")
+
+    exp_dir = EXPS_DIR / config.exp_id
+    runtime = _create_runtime(config, exp_dir)
+    image = runtime.prepare_commit_image(
+        problem,
+        commit.commit_hash,
+        session_id=session_id,
+    )
+    return GeneratedTestExecutionConfig(
+        **{
+            **config.__dict__,
+            "docker_image": image,
+            "docker_base_image": None,
+            "docker_repo_path": None,
+            "rebuild_docker_image": False,
+            "prepared_commit_hash": commit.commit_hash,
+        }
+    )
+
+
+def cleanup_prepared_test_execution(
+    config: GeneratedTestExecutionConfig,
+) -> None:
+    """Remove an image created by :func:`prepare_commit_test_execution`."""
+    if config.backend != "docker" or config.prepared_commit_hash is None:
+        return
+    exp_dir = EXPS_DIR / config.exp_id
+    runtime = _create_runtime(config, exp_dir)
+    runtime.remove_image()
 
 
 def _apply_experiment_overrides(problems: list[Problem], exp_data: dict) -> None:
@@ -575,6 +616,18 @@ async def _async_evaluate_generated_test(
     base commit. That alone qualifies the test as runnable; phase 2 outcome
     and result files are not used in this validation mode.
     """
+    if (
+        config.prepared_commit_hash is not None
+        and config.prepared_commit_hash != commit.commit_hash
+    ):
+        return GeneratedTestExecutionResult(
+            passed=False,
+            error=(
+                "Prepared Docker image candidate mismatch: "
+                f"expected {config.prepared_commit_hash}, got {commit.commit_hash}"
+            ),
+        )
+
     try:
         validation_problem = problem.model_copy(deep=True)
         validation_problem.commits = [commit]

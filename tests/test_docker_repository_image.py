@@ -141,10 +141,60 @@ def test_launch_task_mounts_persistent_build_and_package_cache(tmp_path, monkeyp
     assert "CCACHE_DIR=/gso-cache/ccache" in create_command
     assert "PIP_CACHE_DIR=/gso-cache/pip" in create_command
     assert "UV_CACHE_DIR=/gso-cache/uv" in create_command
+    assert not any("XDG_CACHE" in argument for argument in create_command)
+    assert not (cache_dir / "xdg").exists()
     shell_command = create_command[-1]
     assert "CMAKE_CXX_COMPILER_LAUNCHER=ccache" in shell_command
     assert "USE_CCACHE=1" in shell_command
     assert (cache_dir / "ccache").is_dir()
+
+
+def test_prepare_commit_image_installs_parent_once_without_xdg_cache(
+    tmp_path, monkeypatch
+):
+    cache_dir = tmp_path / "cache"
+    manager = DockerManager(
+        image="gso-repo:latest",
+        artifact_dir=tmp_path / "artifacts",
+        cache_dir=cache_dir,
+    )
+    problem = SimpleNamespace(
+        pid="repo-api",
+        repo=SimpleNamespace(repo_name="repo"),
+        install_commands=[
+            "uv venv --python 3.12",
+            "source .venv/bin/activate",
+            "uv pip install -e .",
+        ],
+    )
+    commands = []
+
+    def fake_run(command, *, check=True, capture_output=False):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(manager, "_run", fake_run)
+
+    image = manager.prepare_commit_image(
+        problem,
+        "1234567890abcdef",
+        session_id="session-1",
+    )
+
+    assert image.startswith("gso-repo:prepared-session-1-1234567890ab-")
+    create_command = next(
+        command for command in commands if command[:2] == ["docker", "create"]
+    )
+    assert not any("XDG_CACHE" in argument for argument in create_command)
+    exec_command = next(
+        command for command in commands if command[:2] == ["docker", "exec"]
+    )
+    install_script = exec_command[-1]
+    assert "git checkout --detach '1234567890abcdef^'" in install_script
+    assert "uv pip install -e ." in install_script
+    assert "/gso-prepared-env.sh" in install_script
+    assert any(command[:2] == ["docker", "commit"] for command in commands)
+    assert commands[-1][:3] == ["docker", "rm", "--force"]
 
 
 def test_phase1_result_collection_skips_missing_results_directory(

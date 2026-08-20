@@ -1,3 +1,4 @@
+import atexit
 import json
 import multiprocessing as mp
 import os
@@ -5,9 +6,11 @@ import re
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import traceback
-from concurrent.futures import as_completed
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +30,9 @@ from gso.constants import (
 )
 from gso.collect.execute.execute import (
     GeneratedTestExecutionConfig,
+    cleanup_prepared_test_execution,
     evaluate_generated_test,
+    prepare_commit_test_execution,
     prepare_generated_test_execution,
 )
 
@@ -45,6 +50,7 @@ IS_RERUN_FLAG = False  # NOTE: runs testgen for valid probs from previous run
 DEBUG_FLAG = False  # NOTE: debug flag to not overwrite existing tests
 REASONING_MODELS = {"o1-mini", "o3-mini", "o1-preview", "o4-mini"}
 SEMANTIC_RETRY_COUNT = 3
+MAX_COMMIT_PREPARATION_WORKERS = 4
 DEFAULT_GENERATION_LLM_CACHE_SETTINGS = {
     "test_generation": False,
 }
@@ -52,6 +58,10 @@ GENERATION_PROGRESS_PREFIX = "Generation progress:"
 GENERATION_EVENT_PREFIX = "Generation event:"
 API_PREFLIGHT_RESULT_PREFIX = "GSO_API_PREFLIGHT_RESULTS="
 CODEX_INSTALL_COMMAND_TIMEOUT_SECONDS = 600
+_PREPARED_EXECUTION_CONFIGS: dict[str, GeneratedTestExecutionConfig] = {}
+_PREPARED_EXECUTION_CONFIGS_LOCK = threading.Lock()
+
+
 CODEX_INSTALL_COMMAND_SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -65,6 +75,36 @@ CODEX_INSTALL_COMMAND_SCHEMA = {
     "required": ["install_commands"],
     "additionalProperties": False,
 }
+
+
+def _register_prepared_execution(config: GeneratedTestExecutionConfig) -> None:
+    if config.docker_image is None or config.prepared_commit_hash is None:
+        return
+    with _PREPARED_EXECUTION_CONFIGS_LOCK:
+        _PREPARED_EXECUTION_CONFIGS[config.docker_image] = config
+
+
+def _cleanup_prepared_execution(config: GeneratedTestExecutionConfig) -> None:
+    image = config.docker_image
+    if image is None:
+        return
+    try:
+        cleanup_prepared_test_execution(config)
+    except Exception as error:
+        logger.warning("Failed to remove prepared image %s: %s", image, error)
+        return
+    with _PREPARED_EXECUTION_CONFIGS_LOCK:
+        _PREPARED_EXECUTION_CONFIGS.pop(image, None)
+
+
+def _cleanup_all_prepared_executions() -> None:
+    with _PREPARED_EXECUTION_CONFIGS_LOCK:
+        configs = list(_PREPARED_EXECUTION_CONFIGS.values())
+    for config in configs:
+        _cleanup_prepared_execution(config)
+
+
+atexit.register(_cleanup_all_prepared_executions)
 
 
 def request_install_commands_from_codex(
@@ -235,7 +275,7 @@ def build_api_preflight_test(apis: list[str], repo_name: str) -> str:
     apis_json = json.dumps(apis, ensure_ascii=False)
     repo_name_json = json.dumps(repo_name)
     prefix_json = json.dumps(API_PREFLIGHT_RESULT_PREFIX)
-    return f'''import ast
+    return f"""import ast
 import importlib
 import importlib.metadata
 import json
@@ -417,7 +457,7 @@ def run_test(eqcheck=False, reference=False, prefix=""):
     elif eqcheck:
         check_equivalence(load_result(result_path), result)
     return execution_time
-'''
+"""
 
 
 def _parse_api_preflight_results(error: str | None) -> dict[str, dict] | None:
@@ -445,97 +485,200 @@ def _commit_date_sort_key(commit: PerformanceCommit) -> tuple[datetime, str]:
     return commit_date.astimezone(timezone.utc), commit.commit_hash
 
 
+def _group_problems_by_commit(
+    problems: list[Problem],
+) -> list[tuple[PerformanceCommit, list[Problem]]]:
+    groups: dict[str, tuple[PerformanceCommit, list[Problem]]] = {}
+    for problem in problems:
+        for commit in problem.commits:
+            _, grouped_problems = groups.setdefault(commit.commit_hash, (commit, []))
+            grouped_problems.append(problem)
+    return sorted(groups.values(), key=lambda group: _commit_date_sort_key(group[0]))
+
+
+def _run_api_preflight_for_commit(
+    commit: PerformanceCommit,
+    grouped_problems: list[Problem],
+    config: GeneratedTestExecutionConfig,
+    *,
+    stage: str,
+) -> tuple[set[str], list[dict]]:
+    representative = grouped_problems[0]
+    apis = [problem.api for problem in grouped_problems]
+    print(
+        f"Preflighting {len(apis)} API reference(s) on {commit.quick_hash()}...",
+        flush=True,
+    )
+    test = build_api_preflight_test(apis, representative.repo.repo_name)
+    try:
+        result = evaluate_generated_test(representative, commit, test, config)
+    except Exception as error:
+        passed = False
+        result_error = f"{type(error).__name__}: {error}"
+        report = None
+    else:
+        passed = result.passed
+        result_error = result.error
+        report = _parse_api_preflight_results(result.error)
+
+    if passed:
+        print(
+            f"API preflight passed for {len(apis)} API(s) on {commit.quick_hash()}",
+            flush=True,
+        )
+        return set(apis), []
+
+    passed_apis: set[str] = set()
+    diagnostics = []
+    problems_by_api = {problem.api: problem for problem in grouped_problems}
+    for api in apis:
+        api_report = report.get(api) if report is not None else None
+        if isinstance(api_report, dict) and api_report.get("ok") is True:
+            passed_apis.add(api)
+            continue
+        error = (
+            (api_report.get("error") or result_error)
+            if isinstance(api_report, dict)
+            else result_error
+        )
+        error = error or "API preflight failed without diagnostics"
+        diagnostics.append(
+            {
+                "pid": problems_by_api[api].pid,
+                "api": api,
+                "commit_hash": commit.commit_hash,
+                "stage": stage,
+                "error": error,
+            }
+        )
+        logger.error(
+            "Skipping API/commit %s/%s after preflight failure: %s",
+            api,
+            commit.quick_hash(),
+            error,
+        )
+    return passed_apis, diagnostics
+
+
+def _filter_problem_commit_pairs(
+    problems: list[Problem], accepted_pairs: set[tuple[str, str]]
+) -> list[Problem]:
+    for problem in problems:
+        problem.commits = [
+            commit
+            for commit in problem.commits
+            if (problem.api, commit.commit_hash) in accepted_pairs
+        ]
+    return [problem for problem in problems if problem.commits]
+
+
 def preflight_generation_problems(
     problems: list[Problem],
     config: GeneratedTestExecutionConfig | None,
 ) -> tuple[list[Problem], list[dict]]:
-    """Verify installation and API references before spending LLM requests.
-
-    APIs sharing a candidate commit are checked in one container, so their common
-    install commands run only once. Commit groups run by ``commit.date`` from
-    oldest to newest to maximize compiler-cache locality. Every API is checked
-    against all of its remaining candidate commits. A missing structured report
-    means setup failed before Python could run, in which case the whole commit
-    group is skipped.
-    Otherwise only APIs reported as unresolved are skipped.
-    """
+    """Preflight commit groups and filter only failing API/commit pairs."""
     if config is None:
         return problems, []
 
-    groups: dict[str, tuple[PerformanceCommit, list[Problem]]] = {}
-    for problem in problems:
-        for commit in problem.commits:
-            _, grouped_problems = groups.setdefault(
-                commit.commit_hash, (commit, [])
-            )
-            grouped_problems.append(problem)
-
-    accepted_apis = {problem.api for problem in problems}
+    accepted_pairs: set[tuple[str, str]] = set()
     diagnostics: list[dict] = []
-    ordered_groups = sorted(
-        groups.values(), key=lambda group: _commit_date_sort_key(group[0])
-    )
-    for commit, original_grouped_problems in ordered_groups:
-        grouped_problems = [
-            problem
-            for problem in original_grouped_problems
-            if problem.api in accepted_apis
-        ]
-        if not grouped_problems:
-            continue
+    for commit, grouped_problems in _group_problems_by_commit(problems):
+        passed_apis, group_diagnostics = _run_api_preflight_for_commit(
+            commit,
+            grouped_problems,
+            config,
+            stage="install_api_preflight",
+        )
+        accepted_pairs.update((api, commit.commit_hash) for api in passed_apis)
+        diagnostics.extend(group_diagnostics)
+    return _filter_problem_commit_pairs(problems, accepted_pairs), diagnostics
+
+
+def prepare_and_preflight_generation_problems(
+    problems: list[Problem],
+    config: GeneratedTestExecutionConfig,
+    *,
+    num_workers: int,
+    session_id: str,
+) -> tuple[
+    list[Problem],
+    list[dict],
+    dict[str, GeneratedTestExecutionConfig],
+]:
+    """Prepare/install and API-preflight unique commits concurrently."""
+    groups = _group_problems_by_commit(problems)
+    accepted_pairs: set[tuple[str, str]] = set()
+    diagnostics: list[dict] = []
+    execution_configs: dict[str, GeneratedTestExecutionConfig] = {}
+
+    def prepare_group(
+        commit: PerformanceCommit, grouped_problems: list[Problem]
+    ) -> tuple[
+        PerformanceCommit,
+        set[str],
+        list[dict],
+        GeneratedTestExecutionConfig | None,
+    ]:
         representative = grouped_problems[0]
         apis = [problem.api for problem in grouped_problems]
         print(
-            f"Preflighting install commands and {len(apis)} API reference(s) "
-            f"on {commit.quick_hash()}...",
+            f"Preparing installation for {len(apis)} API(s) on "
+            f"{commit.quick_hash()}...",
             flush=True,
         )
-        test = build_api_preflight_test(apis, representative.repo.repo_name)
-        passed = False
         try:
-            result = evaluate_generated_test(representative, commit, test, config)
+            prepared_config = prepare_commit_test_execution(
+                representative,
+                commit,
+                config,
+                session_id=session_id,
+            )
         except Exception as error:
-            result_error = f"{type(error).__name__}: {error}"
-            report = None
-        else:
-            passed = result.passed
-            result_error = result.error
-            report = _parse_api_preflight_results(result.error)
-
-        if passed:
-            accepted_apis.update(apis)
-            print(
-                f"API preflight passed for {len(apis)} API(s) on "
-                f"{commit.quick_hash()}",
-                flush=True,
-            )
-            continue
-
-        for api in apis:
-            api_report = report.get(api) if report is not None else None
-            if isinstance(api_report, dict) and api_report.get("ok") is True:
-                continue
-            error = (
-                (api_report.get("error") or result_error)
-                if isinstance(api_report, dict)
-                else result_error
-            )
-            error = error or "install/API preflight failed without diagnostics"
-            accepted_apis.discard(api)
-            diagnostics.append(
+            detail = f"{type(error).__name__}: {error}"
+            group_diagnostics = [
                 {
-                    "pid": next(
-                        problem.pid for problem in grouped_problems if problem.api == api
-                    ),
-                    "api": api,
+                    "pid": problem.pid,
+                    "api": problem.api,
                     "commit_hash": commit.commit_hash,
-                    "stage": "install_api_preflight",
-                    "error": error,
+                    "stage": "commit_environment_prepare",
+                    "error": detail,
                 }
+                for problem in grouped_problems
+            ]
+            logger.error(
+                "Skipping commit %s after environment preparation failure: %s",
+                commit.quick_hash(),
+                detail,
             )
-            logger.error("Skipping API %s after preflight failure: %s", api, error)
+            return commit, set(), group_diagnostics, None
 
-    return [problem for problem in problems if problem.api in accepted_apis], diagnostics
+        _register_prepared_execution(prepared_config)
+        passed_apis, group_diagnostics = _run_api_preflight_for_commit(
+            commit,
+            grouped_problems,
+            prepared_config,
+            stage="api_preflight",
+        )
+        if not passed_apis:
+            _cleanup_prepared_execution(prepared_config)
+            prepared_config = None
+        return commit, passed_apis, group_diagnostics, prepared_config
+
+    workers = min(max(1, num_workers), len(groups), MAX_COMMIT_PREPARATION_WORKERS)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(prepare_group, commit, grouped_problems)
+            for commit, grouped_problems in groups
+        ]
+        for future in as_completed(futures):
+            commit, passed_apis, group_diagnostics, prepared_config = future.result()
+            diagnostics.extend(group_diagnostics)
+            accepted_pairs.update((api, commit.commit_hash) for api in passed_apis)
+            if prepared_config is not None:
+                execution_configs[commit.commit_hash] = prepared_config
+
+    filtered = _filter_problem_commit_pairs(problems, accepted_pairs)
+    return filtered, diagnostics, execution_configs
 
 
 @dataclass(frozen=True)
@@ -1330,9 +1473,27 @@ class PerfExpGenerator:
                 keep_workspaces=args.keep_workspaces,
             ),
         )
-        problems, preflight_diagnostics = preflight_generation_problems(
-            problems, execution_config
-        )
+        generation_session_id = uuid.uuid4().hex[:12]
+        if execution_config is None:
+            # Test-only/no-execution mode: retain the previous behavior without
+            # creating prepared Docker environments.
+            problems, preflight_diagnostics = preflight_generation_problems(
+                problems, None
+            )
+            commit_execution_configs = {
+                commit.commit_hash: None
+                for problem in problems
+                for commit in problem.commits
+            }
+        else:
+            problems, preflight_diagnostics, commit_execution_configs = (
+                prepare_and_preflight_generation_problems(
+                    problems,
+                    execution_config,
+                    num_workers=args.multiprocess,
+                    session_id=generation_session_id,
+                )
+            )
         if not problems:
             retry_path = self.save_retry_diagnostics(preflight_diagnostics, args)
             detail = (
@@ -1369,7 +1530,7 @@ class PerfExpGenerator:
                 task,
                 target_index=target_index,
                 target_count=len(commit_tasks),
-                execution_config=execution_config,
+                execution_config=commit_execution_configs[task.commit.commit_hash],
             )
             for target_index, task in enumerate(commit_tasks)
         ]
@@ -1461,6 +1622,10 @@ class PerfExpGenerator:
                 f"({len(generated_by_commit)}/{len(commit_tasks)})",
                 flush=True,
             )
+
+        for prepared_config in commit_execution_configs.values():
+            if prepared_config is not None:
+                _cleanup_prepared_execution(prepared_config)
 
         if received_output_count != len(commit_tasks):
             generation_errors.append(

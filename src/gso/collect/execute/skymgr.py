@@ -35,6 +35,7 @@ class SkyManager:
         problem,
         phase1_only: bool = False,
         test_timeout: int = 300,
+        prepared_environment: bool = False,
     ):
         setup_commands = "\n  ".join(problem.setup_commands)
         install_commands = ensure_patch_dependencies(
@@ -60,6 +61,7 @@ class SkyManager:
             repo_name=problem.repo.repo_name,
             install_commands=install_commands,
             test_timeout=test_timeout,
+            prepared_environment="true" if prepared_environment else "false",
         )
 
         phase2 = phase2.safe_substitute(
@@ -83,7 +85,10 @@ class SkyManager:
 
     @staticmethod
     def create_workspace(
-        problem, phase1_only: bool = False, test_timeout: int = 300
+        problem,
+        phase1_only: bool = False,
+        test_timeout: int = 300,
+        prepared_environment: bool = False,
     ) -> Path:
         task = SkyManager.load_template(SKYGEN_TEMPLATE)
         phase1 = SkyManager.load_template(PHASE1_TEMPLATE)
@@ -101,6 +106,7 @@ class SkyManager:
                 problem,
                 phase1_only=phase1_only,
                 test_timeout=test_timeout,
+                prepared_environment=prepared_environment,
             )
 
             # each candidate commit is a subdirectory in the workspace

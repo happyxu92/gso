@@ -21,6 +21,7 @@ from gso.collect.generate.generate import (
     generate_commit_tests,
     load_existing_problems,
     preflight_generation_problems,
+    prepare_and_preflight_generation_problems,
     request_install_commands_from_codex,
     save_problems_atomically,
     update_yaml_install_commands,
@@ -271,7 +272,7 @@ def test_preflight_checks_commit_groups_oldest_first(monkeypatch):
     ]
 
 
-def test_preflight_rejects_api_when_a_later_candidate_commit_fails(monkeypatch):
+def test_preflight_rejects_only_later_api_commit_pair(monkeypatch):
     repo = Repo(
         repo_url="https://github.com/example/repo",
         repo_owner="example",
@@ -310,9 +311,90 @@ def test_preflight_rejects_api_when_a_later_candidate_commit_fails(monkeypatch):
         [problem], GeneratedTestExecutionConfig(exp_id="repo")
     )
 
-    assert accepted == []
+    assert accepted == [problem]
+    assert [commit.commit_hash for commit in accepted[0].commits] == [
+        commits[0].commit_hash
+    ]
     assert checked_hashes == [commit.commit_hash for commit in commits]
     assert diagnostics[0]["commit_hash"] == commits[1].commit_hash
+
+
+def test_prepared_preflight_filters_api_commit_pairs_and_keeps_other_commits(
+    monkeypatch,
+):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commits = [
+        PerformanceCommit(
+            commit_hash="1111111234567890",
+            subject="First optimization",
+            message="First optimization",
+            date="2024-01-01T00:00:00",
+        ),
+        PerformanceCommit(
+            commit_hash="2222222234567890",
+            subject="Second optimization",
+            message="Second optimization",
+            date="2024-01-02T00:00:00",
+        ),
+    ]
+    problems = [
+        Problem(pid="repo-good", repo=repo, api="good", commits=list(commits)),
+        Problem(pid="repo-bad", repo=repo, api="bad", commits=[commits[0]]),
+    ]
+    prepared_hashes = []
+
+    def fake_prepare(_problem, commit, config, *, session_id):
+        prepared_hashes.append(commit.commit_hash)
+        return GeneratedTestExecutionConfig(
+            **{
+                **config.__dict__,
+                "docker_image": f"prepared-{commit.quick_hash()}",
+                "prepared_commit_hash": commit.commit_hash,
+            }
+        )
+
+    def fake_evaluate(_problem, commit, _test, _config):
+        if commit == commits[1]:
+            return GeneratedTestExecutionResult(passed=True)
+        report = {
+            "good": {"ok": True, "resolved": "repo.good"},
+            "bad": {"ok": False, "error": "ImportError: unavailable"},
+        }
+        return GeneratedTestExecutionResult(
+            passed=False,
+            error=API_PREFLIGHT_RESULT_PREFIX + json.dumps(report) + "\nfailed",
+        )
+
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.prepare_commit_test_execution", fake_prepare
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.evaluate_generated_test", fake_evaluate
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate._register_prepared_execution",
+        lambda config: None,
+    )
+
+    accepted, diagnostics, configs = prepare_and_preflight_generation_problems(
+        problems,
+        GeneratedTestExecutionConfig(exp_id="repo"),
+        num_workers=2,
+        session_id="unit-test",
+    )
+
+    assert sorted(prepared_hashes) == sorted(commit.commit_hash for commit in commits)
+    assert [problem.api for problem in accepted] == ["good"]
+    assert [commit.commit_hash for commit in accepted[0].commits] == [
+        commit.commit_hash for commit in commits
+    ]
+    assert diagnostics[0]["api"] == "bad"
+    assert diagnostics[0]["commit_hash"] == commits[0].commit_hash
+    assert set(configs) == {commit.commit_hash for commit in commits}
 
 
 def test_codex_install_command_inference_uses_local_repo_and_schema(
@@ -705,7 +787,9 @@ def test_commit_worker_generates_scenario_and_test_together(monkeypatch):
     assert len(payloads) == 2
     assert payloads[0][0]["content"] == "test system"
     assert [message["role"] for message in payloads[0]] == ["system", "user"]
-    assert payloads[0][1]["content"].startswith("commit context\n\nCreate one benchmark")
+    assert payloads[0][1]["content"].startswith(
+        "commit context\n\nCreate one benchmark"
+    )
     assert "write test" not in payloads[0][1]["content"]
     assert payloads[0][1]["content"].count("Use repository fixtures.") == 1
     assert "Return exactly two fenced blocks" in payloads[0][1]["content"]

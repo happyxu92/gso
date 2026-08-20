@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -6,12 +7,14 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 
 import yaml
 
 from gso.collect.execute.helpers import collect_results
 from gso.collect.execute.skymgr import SkyManager
+from gso.harness.environment.patches import ensure_patch_dependencies
 from gso.logger import logger
 
 
@@ -64,6 +67,7 @@ WORKDIR /workspace
         repository_path: Path | None = None,
         rebuild_repository_image: bool = False,
         cache_dir: Path | None = None,
+        prepared_commit_hash: str | None = None,
     ):
         self.image = image
         self.artifact_dir = artifact_dir
@@ -77,20 +81,72 @@ WORKDIR /workspace
         self.cache_dir = (
             Path(cache_dir).expanduser().resolve() if cache_dir is not None else None
         )
+        self.prepared_commit_hash = prepared_commit_hash
         self._containers: set[str] = set()
         self._lock = threading.Lock()
 
-    @staticmethod
     def create_workspace(
-        problem, phase1_only: bool = False, test_timeout: int = 300
+        self, problem, phase1_only: bool = False, test_timeout: int = 300
     ) -> Path:
-        # Docker and SkyPilot consume the same generated tests and phase scripts.
+        # Prepared images are already checked out and installed at the candidate's
+        # parent revision. The phase script verifies that revision instead of
+        # mutating the checkout or rerunning installation commands.
         return SkyManager.create_workspace(
-            problem, phase1_only=phase1_only, test_timeout=test_timeout
+            problem,
+            phase1_only=phase1_only,
+            test_timeout=test_timeout,
+            prepared_environment=self.prepared_commit_hash is not None,
         )
 
     def _platform_args(self) -> list[str]:
         return ["--platform", self.platform] if self.platform else []
+
+    def _cache_mount_args(self) -> list[str]:
+        if self.cache_dir is None:
+            return []
+        # Package and compiler caches are safe to share. Checkout-specific state
+        # such as .venv, build/, dist/, and Rust target/ stays in the container.
+        for child in ("ccache", "sccache", "pip", "uv"):
+            (self.cache_dir / child).mkdir(parents=True, exist_ok=True)
+        return [
+            "--mount",
+            f"type=bind,source={self.cache_dir},target=/gso-cache",
+            "--env",
+            "CCACHE_DIR=/gso-cache/ccache",
+            "--env",
+            "CCACHE_BASEDIR=/workspace",
+            "--env",
+            "CCACHE_COMPILERCHECK=content",
+            "--env",
+            "CCACHE_NOHASHDIR=true",
+            "--env",
+            "PIP_CACHE_DIR=/gso-cache/pip",
+            "--env",
+            "UV_CACHE_DIR=/gso-cache/uv",
+            "--env",
+            "SCCACHE_DIR=/gso-cache/sccache",
+        ]
+
+    @staticmethod
+    def _cache_shell_setup() -> str:
+        return r"""
+if [ -f /gso-prepared-env.sh ]; then
+    source /gso-prepared-env.sh
+fi
+if command -v ccache >/dev/null 2>&1; then
+    export CMAKE_C_COMPILER_LAUNCHER=ccache
+    export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+    export USE_CCACHE=1
+    echo "GSO build cache: ccache (${CCACHE_DIR:-disabled})"
+elif command -v sccache >/dev/null 2>&1; then
+    export CMAKE_C_COMPILER_LAUNCHER=sccache
+    export CMAKE_CXX_COMPILER_LAUNCHER=sccache
+    export RUSTC_WRAPPER=sccache
+    echo "GSO build cache: sccache (${SCCACHE_DIR:-disabled})"
+else
+    echo "GSO build cache: compiler cache unavailable; using package caches only"
+fi
+"""
 
     @staticmethod
     def _run(
@@ -143,7 +199,9 @@ WORKDIR /workspace
         if self.repository_path is not None:
             local_repo = Path(self.repository_path).expanduser().resolve()
             if not local_repo.is_dir():
-                raise ValueError(f"Docker repository path is not a directory: {local_repo}")
+                raise ValueError(
+                    f"Docker repository path is not a directory: {local_repo}"
+                )
             if not (local_repo / ".git").is_dir():
                 raise ValueError(
                     "Docker repository path must be a self-contained Git checkout "
@@ -165,9 +223,11 @@ WORKDIR /workspace
         build_dir.mkdir(parents=True, exist_ok=True)
         dockerfile = build_dir / "Dockerfile"
         dockerfile.write_text(
-            self.local_repository_dockerfile
-            if local_repo is not None
-            else self.repository_dockerfile,
+            (
+                self.local_repository_dockerfile
+                if local_repo is not None
+                else self.repository_dockerfile
+            ),
             encoding="utf-8",
         )
 
@@ -220,6 +280,197 @@ WORKDIR /workspace
             f"repository={repository_source}; log={build_log}",
             flush=True,
         )
+
+    def _prepared_image_name(
+        self,
+        candidate_commit_hash: str,
+        install_commands: list[str],
+        session_id: str,
+    ) -> str:
+        image_without_digest = self.image.split("@", 1)[0]
+        last_slash = image_without_digest.rfind("/")
+        last_colon = image_without_digest.rfind(":")
+        repository = (
+            image_without_digest[:last_colon]
+            if last_colon > last_slash
+            else image_without_digest
+        )
+        safe_session = re.sub(r"[^a-z0-9]+", "-", session_id.lower()).strip("-")
+        safe_session = (safe_session or "session")[:12]
+        environment_key = json.dumps(
+            {
+                "source_image": self.image,
+                "candidate_commit": candidate_commit_hash,
+                "install_commands": install_commands,
+                "platform": self.platform,
+            },
+            sort_keys=True,
+        ).encode()
+        digest = hashlib.sha256(environment_key).hexdigest()[:12]
+        return (
+            f"{repository}:prepared-{safe_session}-"
+            f"{candidate_commit_hash[:12].lower()}-{digest}"
+        )
+
+    def prepare_commit_image(
+        self,
+        problem,
+        candidate_commit_hash: str,
+        *,
+        session_id: str,
+    ) -> str:
+        """Checkout and install one candidate parent into a reusable image.
+
+        Installation runs in a disposable container. Only its filesystem is
+        committed; package/compiler caches remain host mounts, and credentials
+        are supplied to ``docker exec`` rather than stored in container config.
+        """
+        if self.prepared_commit_hash is not None:
+            raise ValueError(
+                "Cannot prepare a commit image from another prepared image"
+            )
+
+        repo_name = problem.repo.repo_name
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", repo_name):
+            raise ValueError(f"Invalid repository name: {repo_name!r}")
+        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", candidate_commit_hash):
+            raise ValueError(
+                f"Invalid candidate commit hash: {candidate_commit_hash!r}"
+            )
+
+        install_commands = ensure_patch_dependencies(
+            problem.pid, list(problem.install_commands)
+        )
+        prepared_image = self._prepared_image_name(
+            candidate_commit_hash, install_commands, session_id
+        )
+        safe_session = re.sub(r"[^a-z0-9]+", "-", session_id.lower()).strip("-")
+        container = (
+            f"gso-prepare-{(safe_session or 'session')[:10]}-"
+            f"{candidate_commit_hash[:12].lower()}-{uuid.uuid4().hex[:6]}"
+        )
+        repo_dir = f"/workspace/{repo_name}"
+        quoted_repo_dir = shlex.quote(repo_dir)
+        quoted_commit = shlex.quote(f"{candidate_commit_hash}^")
+        quoted_candidate_object = shlex.quote(f"{candidate_commit_hash}^{{commit}}")
+        quoted_venv = shlex.quote(f"{repo_dir}/.venv")
+        install_script = "\n".join(install_commands)
+        script = f"""set -euxo pipefail
+{self._cache_shell_setup()}
+cd {quoted_repo_dir}
+git reset --hard
+git clean -ffdx
+git checkout --detach {quoted_commit}
+git submodule update --init --recursive
+{install_script}
+git rev-parse {quoted_candidate_object} > /gso-prepared-candidate
+if [ -x {quoted_venv}/bin/python ]; then
+    cat > /gso-prepared-env.sh <<'GSO_PREPARED_ENV'
+export VIRTUAL_ENV={repo_dir}/.venv
+export PATH={repo_dir}/.venv/bin:$PATH
+GSO_PREPARED_ENV
+else
+    rm -f /gso-prepared-env.sh
+fi
+"""
+
+        create_command = [
+            "docker",
+            "create",
+            "--name",
+            container,
+            "--init",
+            "--label",
+            "gso.managed=true",
+            "--label",
+            f"gso.prepared-session={safe_session or 'session'}",
+            "--workdir",
+            repo_dir,
+            *self._platform_args(),
+            *self._cache_mount_args(),
+        ]
+        if self.cpus is not None:
+            create_command.extend(["--cpus", str(self.cpus)])
+        if self.memory:
+            create_command.extend(["--memory", self.memory])
+        create_command.extend(
+            [
+                self.image,
+                "/bin/bash",
+                "-lc",
+                "while :; do sleep 3600; done",
+            ]
+        )
+
+        log_dir = self.artifact_dir / "prepared_images"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{candidate_commit_hash[:12]}.log"
+        try:
+            self._run(create_command, capture_output=True)
+            self._run(["docker", "start", container], capture_output=True)
+            exec_command = ["docker", "exec"]
+            if os.getenv("HF_TOKEN"):
+                exec_command.extend(["--env", "HF_TOKEN"])
+            exec_command.extend([container, "/bin/bash", "-lc", script])
+            installed = self._run(exec_command, check=False, capture_output=True)
+            log_path.write_text(
+                (installed.stdout or "") + (installed.stderr or ""), encoding="utf-8"
+            )
+            if installed.returncode != 0:
+                detail = (
+                    installed.stderr or installed.stdout or "unknown error"
+                ).strip()
+                raise RuntimeError(
+                    f"Failed to prepare {candidate_commit_hash[:12]}: "
+                    f"{detail[-4000:]}; log={log_path}"
+                )
+
+            committed = self._run(
+                [
+                    "docker",
+                    "commit",
+                    "--pause=true",
+                    "--change",
+                    "LABEL gso.prepared=true",
+                    "--change",
+                    f"LABEL gso.candidate-commit={candidate_commit_hash}",
+                    container,
+                    prepared_image,
+                ],
+                check=False,
+                capture_output=True,
+            )
+            if committed.returncode != 0:
+                detail = (
+                    committed.stderr or committed.stdout or "unknown error"
+                ).strip()
+                raise RuntimeError(
+                    f"Failed to commit prepared image {prepared_image}: {detail[-4000:]}"
+                )
+        finally:
+            self._run(
+                ["docker", "rm", "--force", container],
+                check=False,
+                capture_output=True,
+            )
+
+        print(
+            f"Prepared Docker image {prepared_image} for "
+            f"{candidate_commit_hash[:12]}^; log={log_path}",
+            flush=True,
+        )
+        return prepared_image
+
+    def remove_image(self) -> None:
+        """Remove this runtime's image without touching shared cache directories."""
+        result = self._run(
+            ["docker", "image", "rm", "--force", self.image],
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown error").strip()
+            raise RuntimeError(f"Failed to remove Docker image {self.image}: {detail}")
 
     def validate(self, problems) -> None:
         """Build when requested, then validate the image and candidate commits."""
@@ -361,50 +612,8 @@ WORKDIR /workspace
             "/workspace",
             *self._platform_args(),
         ]
-        cache_setup = ""
-        if self.cache_dir is not None:
-            # uv/pip and ccache are concurrency-safe content-addressed caches.
-            # Do not mount build/ or .venv: those contain checkout-specific state
-            # and can silently execute stale extensions after a commit switch.
-            for child in ("ccache", "pip", "uv", "xdg"):
-                (self.cache_dir / child).mkdir(parents=True, exist_ok=True)
-            command.extend(
-                [
-                    "--mount",
-                    f"type=bind,source={self.cache_dir},target=/gso-cache",
-                    "--env",
-                    "CCACHE_DIR=/gso-cache/ccache",
-                    "--env",
-                    "CCACHE_BASEDIR=/workspace",
-                    "--env",
-                    "CCACHE_COMPILERCHECK=content",
-                    "--env",
-                    "CCACHE_NOHASHDIR=true",
-                    "--env",
-                    "PIP_CACHE_DIR=/gso-cache/pip",
-                    "--env",
-                    "UV_CACHE_DIR=/gso-cache/uv",
-                    "--env",
-                    "XDG_CACHE_HOME=/gso-cache/xdg",
-                    "--env",
-                    "SCCACHE_DIR=/gso-cache/sccache",
-                ]
-            )
-            cache_setup = """
-if command -v ccache >/dev/null 2>&1; then
-    export CMAKE_C_COMPILER_LAUNCHER=ccache
-    export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-    export USE_CCACHE=1
-    echo "GSO build cache: ccache ($CCACHE_DIR)"
-elif command -v sccache >/dev/null 2>&1; then
-    export CMAKE_C_COMPILER_LAUNCHER=sccache
-    export CMAKE_CXX_COMPILER_LAUNCHER=sccache
-    export RUSTC_WRAPPER=sccache
-    echo "GSO build cache: sccache ($SCCACHE_DIR)"
-else
-    echo "GSO build cache: compiler cache unavailable; using package caches only"
-fi
-"""
+        command.extend(self._cache_mount_args())
+        cache_setup = self._cache_shell_setup()
         if self.cpus is not None:
             command.extend(["--cpus", str(self.cpus)])
         if self.memory:

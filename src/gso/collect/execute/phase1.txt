@@ -27,18 +27,50 @@ add_working_pair() {
     fi
 }
 
+workspace_root=$(pwd)
+prepared_environment=${prepared_environment}
+
+prepare_candidate() {
+    local commit_hash=$1
+    cd "$repo_name" || return 1
+
+    if [ "$prepared_environment" = "true" ]; then
+        local expected_parent
+        local actual_head
+        local expected_candidate
+        local prepared_candidate
+        expected_parent=$(git rev-parse "${commit_hash}^") || return 1
+        actual_head=$(git rev-parse HEAD) || return 1
+        expected_candidate=$(git rev-parse "${commit_hash}^{commit}") || return 1
+        prepared_candidate=$(cat /gso-prepared-candidate 2>/dev/null) || return 1
+        if [ "$actual_head" != "$expected_parent" ] || \
+           [ "$prepared_candidate" != "$expected_candidate" ]; then
+            echo "Prepared image revision mismatch for ${commit_hash}: " \
+                 "HEAD=${actual_head}, expected=${expected_parent}, " \
+                 "candidate=${prepared_candidate}, expected candidate=${expected_candidate}"
+            return 1
+        fi
+        echo "Reusing prepared installation for ${commit_hash} (${actual_head})"
+    else
+        git stash -u || return 1
+        git checkout "${commit_hash}^" || return 1
+        $install_commands
+        if [ $? -ne 0 ]; then
+            echo "Install commands failed for ${commit_hash}"
+            return 1
+        fi
+    fi
+
+    cd "$workspace_root" || return 1
+}
+
 # List of commits to try
 candidate_commits=($COMMITS)
 
 for commit_hash in "${candidate_commits[@]}"; do
     echo "Testing candidate commit: ${commit_hash}"
 
-    cd $repo_name && git stash -u
-    # Try to checkout the commit's parent
-    if git checkout "${commit_hash}^"; then
-        $install_commands
-        cd ..
-
+    if prepare_candidate "$commit_hash"; then
         # Try each test file for this commit
         for test_file in "${commit_hash}"/test_*.py; do
             echo "Trying test: ${test_file}"
@@ -54,7 +86,8 @@ for commit_hash in "${candidate_commits[@]}"; do
             fi
         done
     else
-        echo "Failed to checkout commit: ${commit_hash}"
+        cd "$workspace_root" || exit 1
+        echo "Failed to prepare commit: ${commit_hash}"
     fi
 done
 
@@ -65,5 +98,5 @@ if [ "$(cat working_pairs.json)" == "[]" ]; then
 fi
 
 rm -f phase1_results.txt
-rm phase1_*
+rm -f phase1_*
 echo "Phase 1 complete. Working pairs saved to working_pairs.json"
