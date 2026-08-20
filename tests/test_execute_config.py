@@ -2,7 +2,11 @@ from pathlib import Path
 
 import yaml
 
-from gso.collect.execute.execute import _apply_experiment_overrides
+from gso.collect.execute.execute import (
+    GeneratedTestExecutionConfig,
+    _apply_experiment_overrides,
+    _create_runtime,
+)
 from gso.data import Problem, Repo
 
 
@@ -24,6 +28,15 @@ def test_experiment_template_uses_default_install_commands():
     config = yaml.safe_load(template_path.read_text())
 
     assert config["install_commands"] == []
+
+
+def test_default_docker_image_lowercases_exp_id_without_changing_it(tmp_path):
+    config = GeneratedTestExecutionConfig(exp_id="MinerU")
+
+    runtime = _create_runtime(config, tmp_path / config.exp_id)
+
+    assert runtime.image == "gso-mineru:latest"
+    assert config.exp_id == "MinerU"
 
 
 def test_empty_install_commands_preserve_problem_defaults():

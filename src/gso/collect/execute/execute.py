@@ -464,7 +464,7 @@ def _create_runtime(config: GeneratedTestExecutionConfig, exp_dir: Path):
     """Create the execution backend shared by batch and generation validation."""
     if config.backend == "docker":
         return DockerManager(
-            image=config.docker_image or f"gso-{config.exp_id}:latest",
+            image=config.docker_image or f"gso-{config.exp_id.lower()}:latest",
             artifact_dir=exp_dir / "docker_logs" / "generation_validation",
             cpus=config.docker_cpus,
             memory=config.docker_memory,
@@ -727,7 +727,7 @@ async def async_main(
     validate_problem_test_samples(pending_problems)
 
     if backend == "docker":
-        image = docker_image or f"gso-{exp_id}:latest"
+        image = docker_image or f"gso-{exp_id.lower()}:latest"
         runtime = DockerManager(
             image=image,
             artifact_dir=exp_dir / "docker_logs",

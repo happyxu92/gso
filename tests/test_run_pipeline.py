@@ -83,6 +83,33 @@ def test_pipeline_evaluate_stage_builds_dataset(tmp_path):
     assert "--build-dataset" in evaluate_command
 
 
+def test_pipeline_lowercases_only_the_docker_image_name(tmp_path):
+    args = parse_args(["repositories.csv"])
+    paths = compute_paths(tmp_path / "buckets")
+
+    stages = build_stages(
+        repo="MinerU",
+        exp_id="MinerU",
+        repo_checkout=tmp_path / "MinerU",
+        config_path=tmp_path / "MinerU.yaml",
+        plots_dir=tmp_path / "MinerU-plots",
+        args=args,
+        paths=paths,
+    )
+
+    image_names = []
+    for _, command, _ in stages:
+        if "--docker-image" in command:
+            image_names.append(command[command.index("--docker-image") + 1])
+
+    assert image_names
+    assert set(image_names) == {"gso-mineru:latest"}
+    execute_command = next(
+        command for name, command, _ in stages if name == "execute"
+    )
+    assert execute_command[execute_command.index("--exp_id") + 1] == "MinerU"
+
+
 def test_timestamped_uses_beijing_iso_8601_time():
     assert re.fullmatch(rf"{TIMESTAMP_RE} message", timestamped("message"))
 

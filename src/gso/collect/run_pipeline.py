@@ -566,7 +566,7 @@ def build_stages(
 ) -> list[tuple[str, list[str], Path]]:
     """Return [(stage, command, log_path)] in canonical pipeline order."""
     py = args.python
-    repo_image = f"gso-{exp_id}:latest"
+    repo_image = f"gso-{exp_id.lower()}:latest"
     commits_json = paths.analysis_commits / f"{repo}_commits.json"
     apis_json = paths.analysis_apis / f"{repo}_ac_map.json"
     problems_json = paths.experiments / exp_id / f"{exp_id}_problems.json"

@@ -80,6 +80,42 @@ def test_manager_only_creates_missing_problem_runs(tmp_path):
         manager.thread_pool.shutdown(wait=True, cancel_futures=True)
 
 
+def test_async_main_uses_lowercase_default_docker_image(monkeypatch, tmp_path):
+    exp_id = "MinerU"
+    exp_dir = tmp_path / exp_id
+    exp_dir.mkdir()
+    problem = make_problem("MinerU-first", "first")
+    save_problems(exp_dir / f"{exp_id}_problems.json", [problem])
+    captured = {}
+
+    class FakeDockerManager:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def validate(self, problems):
+            assert problems == [problem]
+
+    class FakeExecutionManager:
+        def __init__(self, **kwargs):
+            pass
+
+        def initialize_problems(self):
+            pass
+
+        async def run(self):
+            pass
+
+    monkeypatch.setattr(execute, "EXPS_DIR", tmp_path)
+    monkeypatch.setattr(execute, "DockerManager", FakeDockerManager)
+    monkeypatch.setattr(execute, "ExecutionManager", FakeExecutionManager)
+    monkeypatch.setattr(execute, "validate_problem_test_samples", lambda problems: None)
+
+    asyncio.run(execute.async_main(exp_id, machines=1, runs=1, backend="docker"))
+
+    assert captured["image"] == "gso-mineru:latest"
+    assert (tmp_path / "MinerU").is_dir()
+
+
 def test_async_main_returns_without_starting_backend_when_all_results_exist(
     monkeypatch, tmp_path
 ):
