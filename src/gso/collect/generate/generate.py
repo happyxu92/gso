@@ -496,17 +496,59 @@ def _group_problems_by_commit(
     return sorted(groups.values(), key=lambda group: _commit_date_sort_key(group[0]))
 
 
+def _api_preflight_scope(
+    groups: list[tuple[PerformanceCommit, list[Problem]]],
+) -> tuple[set[tuple[str, str]], set[str]]:
+    pairs = {
+        (problem.api, commit.commit_hash)
+        for commit, grouped_problems in groups
+        for problem in grouped_problems
+    }
+    return pairs, {api for api, _ in pairs}
+
+
+def _print_api_preflight_plan(
+    groups: list[tuple[PerformanceCommit, list[Problem]]],
+) -> None:
+    pairs, apis = _api_preflight_scope(groups)
+    print(
+        f"API preflight: testing {len(pairs)} API/commit pair(s) "
+        f"({len(apis)} unique API(s)) across {len(groups)} commit(s)",
+        flush=True,
+    )
+
+
+def _print_api_preflight_summary(
+    groups: list[tuple[PerformanceCommit, list[Problem]]],
+    accepted_pairs: set[tuple[str, str]],
+) -> None:
+    pairs, apis = _api_preflight_scope(groups)
+    passed_apis = {api for api, _ in accepted_pairs}
+    passed_commits = {commit_hash for _, commit_hash in accepted_pairs}
+    print(
+        f"API preflight complete: {len(accepted_pairs)}/{len(pairs)} "
+        f"API/commit pair(s) passed; retained across "
+        f"{len(passed_commits)}/{len(groups)} commit(s) and "
+        f"{len(passed_apis)}/{len(apis)} unique API(s)",
+        flush=True,
+    )
+
+
 def _run_api_preflight_for_commit(
     commit: PerformanceCommit,
     grouped_problems: list[Problem],
     config: GeneratedTestExecutionConfig,
     *,
     stage: str,
+    task_index: int,
+    task_count: int,
 ) -> tuple[set[str], list[dict]]:
     representative = grouped_problems[0]
     apis = [problem.api for problem in grouped_problems]
+    task_prefix = f"API preflight task {task_index}/{task_count}"
     print(
-        f"Preflighting {len(apis)} API reference(s) on {commit.quick_hash()}...",
+        f"{task_prefix}: testing {len(apis)} API/commit pair(s) on "
+        f"{commit.quick_hash()}...",
         flush=True,
     )
     test = build_api_preflight_test(apis, representative.repo.repo_name)
@@ -521,42 +563,43 @@ def _run_api_preflight_for_commit(
         result_error = result.error
         report = _parse_api_preflight_results(result.error)
 
-    if passed:
-        print(
-            f"API preflight passed for {len(apis)} API(s) on {commit.quick_hash()}",
-            flush=True,
-        )
-        return set(apis), []
-
     passed_apis: set[str] = set()
     diagnostics = []
-    problems_by_api = {problem.api: problem for problem in grouped_problems}
-    for api in apis:
-        api_report = report.get(api) if report is not None else None
-        if isinstance(api_report, dict) and api_report.get("ok") is True:
-            passed_apis.add(api)
-            continue
-        error = (
-            (api_report.get("error") or result_error)
-            if isinstance(api_report, dict)
-            else result_error
-        )
-        error = error or "API preflight failed without diagnostics"
-        diagnostics.append(
-            {
-                "pid": problems_by_api[api].pid,
-                "api": api,
-                "commit_hash": commit.commit_hash,
-                "stage": stage,
-                "error": error,
-            }
-        )
-        logger.error(
-            "Skipping API/commit %s/%s after preflight failure: %s",
-            api,
-            commit.quick_hash(),
-            error,
-        )
+    if passed:
+        passed_apis.update(apis)
+    else:
+        problems_by_api = {problem.api: problem for problem in grouped_problems}
+        for api in apis:
+            api_report = report.get(api) if report is not None else None
+            if isinstance(api_report, dict) and api_report.get("ok") is True:
+                passed_apis.add(api)
+                continue
+            error = (
+                (api_report.get("error") or result_error)
+                if isinstance(api_report, dict)
+                else result_error
+            )
+            error = error or "API preflight failed without diagnostics"
+            diagnostics.append(
+                {
+                    "pid": problems_by_api[api].pid,
+                    "api": api,
+                    "commit_hash": commit.commit_hash,
+                    "stage": stage,
+                    "error": error,
+                }
+            )
+            logger.error(
+                "Skipping API/commit %s/%s after preflight failure: %s",
+                api,
+                commit.quick_hash(),
+                error,
+            )
+    print(
+        f"{task_prefix}: {len(passed_apis)}/{len(apis)} API/commit pair(s) "
+        f"passed on {commit.quick_hash()}",
+        flush=True,
+    )
     return passed_apis, diagnostics
 
 
@@ -580,17 +623,22 @@ def preflight_generation_problems(
     if config is None:
         return problems, []
 
+    groups = _group_problems_by_commit(problems)
+    _print_api_preflight_plan(groups)
     accepted_pairs: set[tuple[str, str]] = set()
     diagnostics: list[dict] = []
-    for commit, grouped_problems in _group_problems_by_commit(problems):
+    for task_index, (commit, grouped_problems) in enumerate(groups, start=1):
         passed_apis, group_diagnostics = _run_api_preflight_for_commit(
             commit,
             grouped_problems,
             config,
             stage="install_api_preflight",
+            task_index=task_index,
+            task_count=len(groups),
         )
         accepted_pairs.update((api, commit.commit_hash) for api in passed_apis)
         diagnostics.extend(group_diagnostics)
+    _print_api_preflight_summary(groups, accepted_pairs)
     return _filter_problem_commit_pairs(problems, accepted_pairs), diagnostics
 
 
@@ -607,12 +655,15 @@ def prepare_and_preflight_generation_problems(
 ]:
     """Prepare/install and API-preflight unique commits concurrently."""
     groups = _group_problems_by_commit(problems)
+    _print_api_preflight_plan(groups)
     accepted_pairs: set[tuple[str, str]] = set()
     diagnostics: list[dict] = []
     execution_configs: dict[str, GeneratedTestExecutionConfig] = {}
 
     def prepare_group(
-        commit: PerformanceCommit, grouped_problems: list[Problem]
+        task_index: int,
+        commit: PerformanceCommit,
+        grouped_problems: list[Problem],
     ) -> tuple[
         PerformanceCommit,
         set[str],
@@ -621,8 +672,9 @@ def prepare_and_preflight_generation_problems(
     ]:
         representative = grouped_problems[0]
         apis = [problem.api for problem in grouped_problems]
+        task_prefix = f"API preflight task {task_index}/{len(groups)}"
         print(
-            f"Preparing installation for {len(apis)} API(s) on "
+            f"{task_prefix}: preparing {len(apis)} API/commit pair(s) on "
             f"{commit.quick_hash()}...",
             flush=True,
         )
@@ -650,6 +702,11 @@ def prepare_and_preflight_generation_problems(
                 commit.quick_hash(),
                 detail,
             )
+            print(
+                f"{task_prefix}: 0/{len(apis)} API/commit pair(s) passed on "
+                f"{commit.quick_hash()} (environment preparation failed)",
+                flush=True,
+            )
             return commit, set(), group_diagnostics, None
 
         _register_prepared_execution(prepared_config)
@@ -658,6 +715,8 @@ def prepare_and_preflight_generation_problems(
             grouped_problems,
             prepared_config,
             stage="api_preflight",
+            task_index=task_index,
+            task_count=len(groups),
         )
         if not passed_apis:
             _cleanup_prepared_execution(prepared_config)
@@ -667,8 +726,8 @@ def prepare_and_preflight_generation_problems(
     workers = min(max(1, num_workers), len(groups), MAX_COMMIT_PREPARATION_WORKERS)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
-            pool.submit(prepare_group, commit, grouped_problems)
-            for commit, grouped_problems in groups
+            pool.submit(prepare_group, task_index, commit, grouped_problems)
+            for task_index, (commit, grouped_problems) in enumerate(groups, start=1)
         ]
         for future in as_completed(futures):
             commit, passed_apis, group_diagnostics, prepared_config = future.result()
@@ -677,6 +736,7 @@ def prepare_and_preflight_generation_problems(
             if prepared_config is not None:
                 execution_configs[commit.commit_hash] = prepared_config
 
+    _print_api_preflight_summary(groups, accepted_pairs)
     filtered = _filter_problem_commit_pairs(problems, accepted_pairs)
     return filtered, diagnostics, execution_configs
 
@@ -1536,8 +1596,12 @@ class PerfExpGenerator:
         ]
 
         commit_workers = min(args.multiprocess, len(commit_tasks))
+        generation_commit_count = len(
+            {task.commit.commit_hash for task in commit_tasks}
+        )
         print(
-            f"Generating {len(problems)} problems across {len(commit_tasks)} commits "
+            f"Generating {len(problems)} problems for {len(commit_tasks)} "
+            f"API/commit task(s) across {generation_commit_count} commit(s) "
             f"(tests_per_commit={args.n}, choices_per_request=1, "
             f"commit_workers={commit_workers}, max_tokens={args.max_tokens}, "
             f"stream={args.stream})"

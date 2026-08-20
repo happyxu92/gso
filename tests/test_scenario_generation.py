@@ -137,7 +137,9 @@ def test_api_preflight_test_resolves_qualified_and_exported_apis(capsys):
     assert API_PREFLIGHT_RESULT_PREFIX in capsys.readouterr().out
 
 
-def test_preflight_skips_only_unresolved_api_in_shared_commit_group(monkeypatch):
+def test_preflight_skips_only_unresolved_api_in_shared_commit_group(
+    monkeypatch, capsys
+):
     repo = Repo(
         repo_url="https://github.com/example/repo",
         repo_owner="example",
@@ -191,6 +193,17 @@ def test_preflight_skips_only_unresolved_api_in_shared_commit_group(monkeypatch)
             "error": "ImportError: missing API",
         }
     ]
+    output = capsys.readouterr().out
+    assert (
+        "API preflight: testing 2 API/commit pair(s) (2 unique API(s)) "
+        "across 1 commit(s)" in output
+    )
+    assert "API preflight task 1/1: testing 2 API/commit pair(s)" in output
+    assert "API preflight task 1/1: 1/2 API/commit pair(s) passed" in output
+    assert (
+        "API preflight complete: 1/2 API/commit pair(s) passed; retained across "
+        "1/1 commit(s) and 1/2 unique API(s)" in output
+    )
 
 
 def test_preflight_skips_commit_group_when_install_fails(monkeypatch):
