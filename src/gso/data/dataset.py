@@ -1,4 +1,18 @@
+import re
 from dataclasses import dataclass
+
+
+_INSTANCE_ID_API_SEPARATOR = re.compile(r"[^a-z0-9]+")
+
+
+def create_instance_id(repo: str, api: str, commit_hash: str) -> str:
+    """Build a filesystem- and Docker-safe ID from a repo, API, and commit."""
+    api_slug = _INSTANCE_ID_API_SEPARATOR.sub("-", api.lower()).strip("-")
+    if not api_slug:
+        raise ValueError(f"API name cannot be converted to an instance ID: {api!r}")
+
+    repo_slug = repo.replace("/", "__")
+    return f"{repo_slug}-{api_slug}-{commit_hash}"
 
 
 @dataclass

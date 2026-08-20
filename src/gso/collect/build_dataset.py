@@ -9,7 +9,7 @@ from datasets import Dataset
 
 from gso.constants import *
 from gso.data.problem import Problem
-from gso.data.dataset import GSOInstance
+from gso.data.dataset import GSOInstance, create_instance_id
 from gso.data.perf import PerformanceCommit
 from gso.collect.execute.evaluate import speedup_summary, create_analysis_dataframe
 from gso.collect.execute.helpers import resolve_results_path
@@ -77,7 +77,7 @@ def create_instance(prob: Problem, commit_hash: str, test_ids: list[int]):
     prob_script = prepare_prob_script(test_samples)
 
     return {
-        "instance_id": (prob.repo.full_name + "-" + commit_hash).replace("/", "__"),
+        "instance_id": create_instance_id(prob.repo.full_name, prob.api, commit_hash),
         "repo": prob.repo.full_name,
         "base_commit": base_commit,
         "opt_commit": opt_commit,
