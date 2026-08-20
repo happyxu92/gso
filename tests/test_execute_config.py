@@ -39,6 +39,25 @@ def test_default_docker_image_lowercases_exp_id_without_changing_it(tmp_path):
     assert config.exp_id == "MinerU"
 
 
+def test_default_docker_cache_is_scoped_to_experiment(tmp_path):
+    config = GeneratedTestExecutionConfig(exp_id="repo")
+
+    runtime = _create_runtime(config, tmp_path / config.exp_id)
+
+    assert runtime.cache_dir == (tmp_path / "repo" / "docker_cache").resolve()
+
+
+def test_explicit_docker_cache_directory_is_used(tmp_path):
+    cache_dir = tmp_path / "shared" / "repo"
+    config = GeneratedTestExecutionConfig(
+        exp_id="repo", docker_cache_dir=str(cache_dir)
+    )
+
+    runtime = _create_runtime(config, tmp_path / config.exp_id)
+
+    assert runtime.cache_dir == cache_dir.resolve()
+
+
 def test_empty_install_commands_preserve_problem_defaults():
     problem = make_problem()
     default_commands = list(problem.install_commands)

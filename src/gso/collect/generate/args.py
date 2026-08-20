@@ -57,6 +57,13 @@ class PerfExpGenArgs(LLMArgs):
         None,
         description="Local repository checkout copied into the Docker image.",
     )
+    docker_cache_dir: str | None = Field(
+        None,
+        description=(
+            "Persistent per-repository package/compiler cache directory "
+            "(default: <experiment>/docker_cache)."
+        ),
+    )
     docker_cpus: float | None = Field(None, gt=0, description="Docker CPU limit.")
     docker_memory: str | None = Field(None, description="Docker memory limit.")
     docker_platform: str | None = Field(

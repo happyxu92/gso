@@ -94,6 +94,7 @@ class GeneratedTestExecutionConfig:
     docker_platform: str | None = None
     docker_base_image: str | None = None
     docker_repo_path: str | None = None
+    docker_cache_dir: str | None = None
     rebuild_docker_image: bool = False
     keep_containers: bool = False
     keep_workspaces: bool = False
@@ -477,6 +478,11 @@ def _create_runtime(config: GeneratedTestExecutionConfig, exp_dir: Path):
                 else None
             ),
             rebuild_repository_image=config.rebuild_docker_image,
+            cache_dir=(
+                Path(config.docker_cache_dir).expanduser()
+                if config.docker_cache_dir
+                else exp_dir / "docker_cache"
+            ),
         )
     if config.backend == "sky":
         return SkyManager()
@@ -667,6 +673,7 @@ async def async_main(
     docker_platform: str | None = None,
     docker_base_image: str | None = None,
     docker_repo_path: str | None = None,
+    docker_cache_dir: str | None = None,
     rebuild_docker_image: bool = False,
     keep_containers: bool = False,
     keep_workspaces: bool = False,
@@ -740,6 +747,11 @@ async def async_main(
                 Path(docker_repo_path).expanduser() if docker_repo_path else None
             ),
             rebuild_repository_image=rebuild_docker_image,
+            cache_dir=(
+                Path(docker_cache_dir).expanduser()
+                if docker_cache_dir
+                else exp_dir / "docker_cache"
+            ),
         )
         effective_poll_interval = 1 if poll_interval is None else poll_interval
         if machines > 1:
@@ -792,6 +804,7 @@ def main(
     docker_platform: str | None = None,
     docker_base_image: str | None = None,
     docker_repo_path: str | None = None,
+    docker_cache_dir: str | None = None,
     rebuild_docker_image: bool = False,
     keep_containers: bool = False,
     keep_workspaces: bool = False,
@@ -814,6 +827,7 @@ def main(
             docker_platform,
             docker_base_image,
             docker_repo_path,
+            docker_cache_dir,
             rebuild_docker_image,
             keep_containers,
             keep_workspaces,
@@ -883,6 +897,14 @@ if __name__ == "__main__":
         ),
     )
     docker_group.add_argument(
+        "--docker-cache-dir",
+        default=None,
+        help=(
+            "Persistent per-repository package/compiler cache directory "
+            "(default: <experiment>/docker_cache)"
+        ),
+    )
+    docker_group.add_argument(
         "--rebuild-docker-image",
         action="store_true",
         help="Build the repository image without Docker layer cache",
@@ -925,6 +947,7 @@ if __name__ == "__main__":
         args.docker_platform,
         args.docker_base_image,
         args.docker_repo_path,
+        args.docker_cache_dir,
         args.rebuild_docker_image,
         args.keep_containers,
         args.keep_workspaces,

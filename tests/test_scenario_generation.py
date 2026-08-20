@@ -221,6 +221,56 @@ def test_preflight_skips_commit_group_when_install_fails(monkeypatch):
     assert diagnostics[0]["error"] == "install command exited with status 1"
 
 
+def test_preflight_checks_commit_groups_oldest_first(monkeypatch):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commits = [
+        PerformanceCommit(
+            commit_hash="3333333334567890",
+            subject="Newest optimization",
+            message="Newest optimization",
+            date="2024-03-01T00:00:00+00:00",
+        ),
+        PerformanceCommit(
+            commit_hash="1111111114567890",
+            subject="Oldest optimization",
+            message="Oldest optimization",
+            date="2024-01-01T00:00:00",
+        ),
+        PerformanceCommit(
+            commit_hash="2222222224567890",
+            subject="Middle optimization",
+            message="Middle optimization",
+            date="2024-02-01T00:00:00+00:00",
+        ),
+    ]
+    problem = Problem(pid="repo-target", repo=repo, api="target", commits=commits)
+    checked_hashes = []
+
+    def fake_evaluate(_problem, commit, _test, _config):
+        checked_hashes.append(commit.commit_hash)
+        return GeneratedTestExecutionResult(passed=True)
+
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.evaluate_generated_test", fake_evaluate
+    )
+
+    accepted, diagnostics = preflight_generation_problems(
+        [problem], GeneratedTestExecutionConfig(exp_id="repo")
+    )
+
+    assert accepted == [problem]
+    assert diagnostics == []
+    assert checked_hashes == [
+        "1111111114567890",
+        "2222222224567890",
+        "3333333334567890",
+    ]
+
+
 def test_preflight_rejects_api_when_a_later_candidate_commit_fails(monkeypatch):
     repo = Repo(
         repo_url="https://github.com/example/repo",

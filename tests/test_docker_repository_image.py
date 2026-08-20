@@ -36,9 +36,11 @@ def test_build_repository_image_clones_experiment_repository(tmp_path, monkeypat
     assert build_command[-1] == str(tmp_path / "repository_image")
 
     dockerfile = tmp_path / "repository_image" / "Dockerfile"
-    assert 'git clone --recursive "$REPO_URL" "/workspace/$REPO_NAME"' in (
-        dockerfile.read_text(encoding="utf-8")
+    dockerfile_text = dockerfile.read_text(encoding="utf-8")
+    assert (
+        'git clone --recursive "$REPO_URL" "/workspace/$REPO_NAME"' in dockerfile_text
     )
+    assert "apt-get install -y --no-install-recommends ccache" in dockerfile_text
     assert (tmp_path / "repository_image" / "build.log").read_text(
         encoding="utf-8"
     ) == "built\n"
@@ -104,6 +106,45 @@ def test_build_repository_image_requires_one_repository(tmp_path):
                 make_problem("https://github.com/example/other", "other"),
             ]
         )
+
+
+def test_launch_task_mounts_persistent_build_and_package_cache(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task_name = "repo-api_task.yaml"
+    (workspace / task_name).write_text("run: echo ready\n", encoding="utf-8")
+    cache_dir = tmp_path / "repo-cache"
+    manager = DockerManager(
+        image="gso-repo:latest",
+        artifact_dir=tmp_path / "artifacts",
+        cache_dir=cache_dir,
+    )
+    commands = []
+
+    def fake_run(command, *, check=True, capture_output=False):
+        commands.append(command)
+        if command[:3] == ["docker", "container", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(manager, "_run", fake_run)
+
+    manager.launch_task(task_name, workspace, cluster="docker-gso-cache-test")
+
+    create_command = next(
+        command for command in commands if command[:2] == ["docker", "create"]
+    )
+    mount_index = create_command.index("--mount")
+    assert create_command[mount_index + 1] == (
+        f"type=bind,source={cache_dir.resolve()},target=/gso-cache"
+    )
+    assert "CCACHE_DIR=/gso-cache/ccache" in create_command
+    assert "PIP_CACHE_DIR=/gso-cache/pip" in create_command
+    assert "UV_CACHE_DIR=/gso-cache/uv" in create_command
+    shell_command = create_command[-1]
+    assert "CMAKE_CXX_COMPILER_LAUNCHER=ccache" in shell_command
+    assert "USE_CCACHE=1" in shell_command
+    assert (cache_dir / "ccache").is_dir()
 
 
 def test_phase1_result_collection_skips_missing_results_directory(

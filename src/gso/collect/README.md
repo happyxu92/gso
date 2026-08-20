@@ -145,6 +145,17 @@ Omit `--docker-repo-path` to retain the remote-clone build behavior. Without
 `--docker-base-image`, `--docker-image` must already contain the repository
 checkout.
 
+Docker tasks mount a persistent cache at
+`~/buckets/gso_bucket/experiments/<exp_id>/docker_cache` by default. The cache
+is isolated per experiment/repository and is shared by preflight and
+generated-test validation containers. It contains uv, pip, and C/C++ compiler
+cache data; the repository image installs `ccache` when its base supports APT.
+Override the location with `--docker-cache-dir`. The first source build still
+compiles
+normally, while later builds of nearby commits can reuse matching object files.
+GSO intentionally does not share `build/` or `.venv`, because those directories
+can contain stale checkout-specific extensions.
+
 Docker results and container logs are saved separately as
 `{exp_id}_results_docker.json` and `docker_logs/` in the experiment directory.
 Analyze the local parent-to-candidate comparison with:

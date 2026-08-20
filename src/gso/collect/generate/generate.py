@@ -437,6 +437,14 @@ def _parse_api_preflight_results(error: str | None) -> dict[str, dict] | None:
     return parsed
 
 
+def _commit_date_sort_key(commit: PerformanceCommit) -> tuple[datetime, str]:
+    """Return a deterministic oldest-first key, normalizing naive dates to UTC."""
+    commit_date = commit.date
+    if commit_date.tzinfo is None:
+        commit_date = commit_date.replace(tzinfo=timezone.utc)
+    return commit_date.astimezone(timezone.utc), commit.commit_hash
+
+
 def preflight_generation_problems(
     problems: list[Problem],
     config: GeneratedTestExecutionConfig | None,
@@ -444,9 +452,11 @@ def preflight_generation_problems(
     """Verify installation and API references before spending LLM requests.
 
     APIs sharing a candidate commit are checked in one container, so their common
-    install commands run only once. Every API is checked against all of its
-    remaining candidate commits. A missing structured report means setup failed
-    before Python could run, in which case the whole commit group is skipped.
+    install commands run only once. Commit groups run by ``commit.date`` from
+    oldest to newest to maximize compiler-cache locality. Every API is checked
+    against all of its remaining candidate commits. A missing structured report
+    means setup failed before Python could run, in which case the whole commit
+    group is skipped.
     Otherwise only APIs reported as unresolved are skipped.
     """
     if config is None:
@@ -462,7 +472,10 @@ def preflight_generation_problems(
 
     accepted_apis = {problem.api for problem in problems}
     diagnostics: list[dict] = []
-    for commit, original_grouped_problems in groups.values():
+    ordered_groups = sorted(
+        groups.values(), key=lambda group: _commit_date_sort_key(group[0])
+    )
+    for commit, original_grouped_problems in ordered_groups:
         grouped_problems = [
             problem
             for problem in original_grouped_problems
@@ -1311,6 +1324,7 @@ class PerfExpGenerator:
                 docker_platform=args.docker_platform,
                 docker_base_image=args.docker_base_image,
                 docker_repo_path=repo_path,
+                docker_cache_dir=args.docker_cache_dir,
                 rebuild_docker_image=args.rebuild_docker_image,
                 keep_containers=args.keep_containers,
                 keep_workspaces=args.keep_workspaces,
@@ -1347,6 +1361,9 @@ class PerfExpGenerator:
         ]
         if not commit_tasks:
             raise RuntimeError("No commit generation tasks were prepared")
+        # Submit generation workers oldest-first as well. With multiple workers,
+        # commits can overlap, but the queue still favors nearby earlier revisions.
+        commit_tasks.sort(key=lambda task: _commit_date_sort_key(task.commit))
         commit_tasks = [
             replace(
                 task,

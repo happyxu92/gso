@@ -22,6 +22,13 @@ class DockerManager:
     repository_dockerfile = """# syntax=docker/dockerfile:1
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
+# Install the compiler-cache client once in the repository image. The cache
+# contents themselves live on the host and are mounted into task containers.
+RUN if ! command -v ccache >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then \\
+        apt-get update \\
+        && apt-get install -y --no-install-recommends ccache \\
+        && rm -rf /var/lib/apt/lists/*; \\
+    fi
 ARG REPO_URL
 ARG REPO_NAME
 RUN test -n "$REPO_URL" && test -n "$REPO_NAME" \\
@@ -33,6 +40,12 @@ WORKDIR /workspace
     local_repository_dockerfile = """# syntax=docker/dockerfile:1
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
+# Keep this layer identical to the remote-clone image so Docker can reuse it.
+RUN if ! command -v ccache >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then \\
+        apt-get update \\
+        && apt-get install -y --no-install-recommends ccache \\
+        && rm -rf /var/lib/apt/lists/*; \\
+    fi
 ARG REPO_NAME
 RUN test -n "$REPO_NAME" && mkdir -p /workspace
 COPY repository /workspace/${REPO_NAME}
@@ -50,6 +63,7 @@ WORKDIR /workspace
         repository_base_image: str | None = None,
         repository_path: Path | None = None,
         rebuild_repository_image: bool = False,
+        cache_dir: Path | None = None,
     ):
         self.image = image
         self.artifact_dir = artifact_dir
@@ -60,6 +74,9 @@ WORKDIR /workspace
         self.repository_base_image = repository_base_image
         self.repository_path = repository_path
         self.rebuild_repository_image = rebuild_repository_image
+        self.cache_dir = (
+            Path(cache_dir).expanduser().resolve() if cache_dir is not None else None
+        )
         self._containers: set[str] = set()
         self._lock = threading.Lock()
 
@@ -344,6 +361,50 @@ WORKDIR /workspace
             "/workspace",
             *self._platform_args(),
         ]
+        cache_setup = ""
+        if self.cache_dir is not None:
+            # uv/pip and ccache are concurrency-safe content-addressed caches.
+            # Do not mount build/ or .venv: those contain checkout-specific state
+            # and can silently execute stale extensions after a commit switch.
+            for child in ("ccache", "pip", "uv", "xdg"):
+                (self.cache_dir / child).mkdir(parents=True, exist_ok=True)
+            command.extend(
+                [
+                    "--mount",
+                    f"type=bind,source={self.cache_dir},target=/gso-cache",
+                    "--env",
+                    "CCACHE_DIR=/gso-cache/ccache",
+                    "--env",
+                    "CCACHE_BASEDIR=/workspace",
+                    "--env",
+                    "CCACHE_COMPILERCHECK=content",
+                    "--env",
+                    "CCACHE_NOHASHDIR=true",
+                    "--env",
+                    "PIP_CACHE_DIR=/gso-cache/pip",
+                    "--env",
+                    "UV_CACHE_DIR=/gso-cache/uv",
+                    "--env",
+                    "XDG_CACHE_HOME=/gso-cache/xdg",
+                    "--env",
+                    "SCCACHE_DIR=/gso-cache/sccache",
+                ]
+            )
+            cache_setup = """
+if command -v ccache >/dev/null 2>&1; then
+    export CMAKE_C_COMPILER_LAUNCHER=ccache
+    export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+    export USE_CCACHE=1
+    echo "GSO build cache: ccache ($CCACHE_DIR)"
+elif command -v sccache >/dev/null 2>&1; then
+    export CMAKE_C_COMPILER_LAUNCHER=sccache
+    export CMAKE_CXX_COMPILER_LAUNCHER=sccache
+    export RUSTC_WRAPPER=sccache
+    echo "GSO build cache: sccache ($SCCACHE_DIR)"
+else
+    echo "GSO build cache: compiler cache unavailable; using package caches only"
+fi
+"""
         if self.cpus is not None:
             command.extend(["--cpus", str(self.cpus)])
         if self.memory:
@@ -354,7 +415,9 @@ WORKDIR /workspace
 
         # The image already contains /workspace/<repo>. Copy only the generated
         # phase scripts and tests, preserving the repository baked into it.
-        command.extend([self.image, "/bin/bash", "-lc", f"set -e\n{run_command}"])
+        command.extend(
+            [self.image, "/bin/bash", "-lc", f"set -e\n{cache_setup}{run_command}"]
+        )
         self._run(command, capture_output=True)
         with self._lock:
             self._containers.add(cluster)
