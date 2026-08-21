@@ -27,7 +27,7 @@ from gso.utils.multiprocess import run_tasks_in_parallel_iter
 
 GSO_BASE_IMAGE_AMD64 = (
     "ling-swe-acr-registry-vpc.cn-hongkong.cr.aliyuncs.com/"
-    "swerebench/gso-base:ubuntu22.04-py312-uv0.5.4-amd64"
+    "swerebench/gso-base:ubuntu22.04-py312-uv0.12.0-amd64"
 )
 _INSTANCE_DOCKERFILE_MARKER = "# Copy and setup the repo"
 

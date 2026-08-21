@@ -116,15 +116,15 @@ checkout when building the execution image:
 # Build the base image once, if it has not already been built.
 docker build \
   --platform linux/amd64 \
-  -t gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
-  -f ../../dockerfiles/Dockerfile.gso-base-ubuntu22.04-py312-uv0.5.4-amd64 \
+  -t gso-base:ubuntu22.04-py312-uv0.12.0-amd64 \
+  -f ../../dockerfiles/Dockerfile.gso-base-ubuntu22.04-py312-uv0.12.0-amd64 \
   ../..
 
 python src/gso/collect/execute/execute.py \
   --backend docker \
   --exp_id numpy \
   --api numpy.add \
-  --docker-base-image gso-base:ubuntu22.04-py312-uv0.5.4-amd64 \
+  --docker-base-image gso-base:ubuntu22.04-py312-uv0.12.0-amd64 \
   --docker-repo-path ~/buckets/gso_bucket/analysis/repos/numpy \
   --docker-image gso-numpy:latest \
   --docker-platform linux/amd64 \

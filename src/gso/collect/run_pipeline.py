@@ -69,7 +69,7 @@ _REPO_ROOT = _THIS_DIR.parents[2]  # GSO repository root
 _DEFAULT_TEMPLATE = _REPO_ROOT / "assets" / "experiment.yaml"
 
 DEFAULT_BUCKETS_DIR = Path.home() / "buckets"
-DEFAULT_BASE_IMAGE = "gso-base:ubuntu22.04-py312-uv0.5.4-amd64"
+DEFAULT_BASE_IMAGE = "gso-base:ubuntu22.04-py312-uv0.12.0-amd64"
 DEFAULT_DOCKER_PLATFORM = "linux/amd64"
 DEFAULT_MAX_YEAR = 2022
 DEFAULT_MAX_COMMITS = 300

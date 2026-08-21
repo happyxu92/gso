@@ -75,7 +75,7 @@ RUN conda init --all \
 # downstream pip/uv commands in task images.
 ENV PIP_INDEX_URL=${PYPI_INDEX_URL} \
     UV_INDEX_URL=${PYPI_INDEX_URL}
-RUN python -m pip install --no-cache-dir uv==0.5.4
+RUN python -m pip install --no-cache-dir uv==0.12.0
 
 RUN adduser --disabled-password --gecos 'dog' nonroot
 
