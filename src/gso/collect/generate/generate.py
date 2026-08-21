@@ -30,6 +30,7 @@ from gso.constants import (
 )
 from gso.collect.execute.execute import (
     GeneratedTestExecutionConfig,
+    GeneratedTestExecutionResult,
     cleanup_prepared_test_execution,
     evaluate_generated_test,
     prepare_commit_test_execution,
@@ -44,6 +45,7 @@ from gso.utils.llm import (
 from gso.collect.generate.prompt import *
 from gso.collect.generate.helpers import *
 from gso.collect.generate.context import prepare_mp_helper
+from gso.collect.generate.api_context import build_parent_api_preflight_test
 from gso.collect.generate.args import PerfExpGenArgs
 
 IS_RERUN_FLAG = False  # NOTE: runs testgen for valid probs from previous run
@@ -263,8 +265,8 @@ def create_generation_problem(
     return Problem.create_prob(repo, api, commits, config)
 
 
-def build_api_preflight_test(apis: list[str], repo_name: str) -> str:
-    """Build a smoke test that imports and resolves each requested Python API.
+def _build_legacy_api_preflight_test(apis: list[str], repo_name: str) -> str:
+    """Build the legacy import-only API smoke test.
 
     API analysis sometimes records a fully qualified name (``numpy.asarray``),
     but it can also record a class method without its module
@@ -460,14 +462,23 @@ def run_test(eqcheck=False, reference=False, prefix=""):
 """
 
 
-def _parse_api_preflight_results(error: str | None) -> dict[str, dict] | None:
-    """Extract the compact per-API report printed by a failed smoke test."""
-    if not error:
+def build_api_preflight_test(apis: list[str], repo_name: str) -> str:
+    """Build a parent-revision API resolution and metadata probe."""
+    return build_parent_api_preflight_test(
+        apis,
+        repo_name,
+        API_PREFLIGHT_RESULT_PREFIX,
+    )
+
+
+def _parse_api_preflight_results(output: str | None) -> dict[str, dict] | None:
+    """Extract the per-API report emitted by the parent-revision probe."""
+    if not output:
         return None
-    marker_index = error.rfind(API_PREFLIGHT_RESULT_PREFIX)
+    marker_index = output.rfind(API_PREFLIGHT_RESULT_PREFIX)
     if marker_index < 0:
         return None
-    report = error[marker_index + len(API_PREFLIGHT_RESULT_PREFIX) :].splitlines()[0]
+    report = output[marker_index + len(API_PREFLIGHT_RESULT_PREFIX) :].splitlines()[0]
     try:
         parsed = json.loads(report)
     except json.JSONDecodeError:
@@ -475,6 +486,26 @@ def _parse_api_preflight_results(error: str | None) -> dict[str, dict] | None:
     if not isinstance(parsed, dict):
         return None
     return parsed
+
+
+def _api_preflight_report(
+    result: GeneratedTestExecutionResult,
+) -> dict[str, dict] | None:
+    """Load a complete probe report from its persisted Docker log."""
+    if result.log_path:
+        try:
+            log_text = Path(result.log_path).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError as error:
+            logger.warning(
+                "Failed to read API preflight log %s: %s", result.log_path, error
+            )
+        else:
+            report = _parse_api_preflight_results(log_text)
+            if report is not None:
+                return report
+    return _parse_api_preflight_results(result.error)
 
 
 def _commit_date_sort_key(commit: PerformanceCommit) -> tuple[datetime, str]:
@@ -542,7 +573,7 @@ def _run_api_preflight_for_commit(
     stage: str,
     task_index: int,
     task_count: int,
-) -> tuple[set[str], list[dict]]:
+) -> tuple[set[str], list[dict], dict[str, dict]]:
     representative = grouped_problems[0]
     apis = [problem.api for problem in grouped_problems]
     task_prefix = f"API preflight task {task_index}/{task_count}"
@@ -561,10 +592,34 @@ def _run_api_preflight_for_commit(
     else:
         passed = result.passed
         result_error = result.error
-        report = _parse_api_preflight_results(result.error)
+        report = _api_preflight_report(result)
+
+    if passed and config.prepared_commit_hash is not None:
+        missing_reports = [
+            api
+            for api in apis
+            if report is None
+            or not isinstance(report.get(api), dict)
+            or report[api].get("ok") is not True
+        ]
+        if missing_reports:
+            passed = False
+            result_error = (
+                "Parent API context probe produced no successful metadata for: "
+                + ", ".join(missing_reports)
+            )
 
     passed_apis: set[str] = set()
+    api_contexts: dict[str, dict] = {}
     diagnostics = []
+    if report is not None:
+        for api in apis:
+            api_report = report.get(api)
+            if isinstance(api_report, dict) and api_report.get("ok") is True:
+                api_contexts[api] = {
+                    key: value for key, value in api_report.items() if key != "ok"
+                }
+
     if passed:
         passed_apis.update(apis)
     else:
@@ -600,7 +655,7 @@ def _run_api_preflight_for_commit(
         f"passed on {commit.quick_hash()}",
         flush=True,
     )
-    return passed_apis, diagnostics
+    return passed_apis, diagnostics, api_contexts
 
 
 def _filter_problem_commit_pairs(
@@ -628,7 +683,7 @@ def preflight_generation_problems(
     accepted_pairs: set[tuple[str, str]] = set()
     diagnostics: list[dict] = []
     for task_index, (commit, grouped_problems) in enumerate(groups, start=1):
-        passed_apis, group_diagnostics = _run_api_preflight_for_commit(
+        passed_apis, group_diagnostics, _ = _run_api_preflight_for_commit(
             commit,
             grouped_problems,
             config,
@@ -710,7 +765,7 @@ def prepare_and_preflight_generation_problems(
             return commit, set(), group_diagnostics, None
 
         _register_prepared_execution(prepared_config)
-        passed_apis, group_diagnostics = _run_api_preflight_for_commit(
+        passed_apis, group_diagnostics, api_contexts = _run_api_preflight_for_commit(
             commit,
             grouped_problems,
             prepared_config,
@@ -718,6 +773,7 @@ def prepare_and_preflight_generation_problems(
             task_index=task_index,
             task_count=len(groups),
         )
+        prepared_config = replace(prepared_config, api_contexts=api_contexts)
         if not passed_apis:
             _cleanup_prepared_execution(prepared_config)
             prepared_config = None
@@ -933,7 +989,12 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
     )
 
     try:
-        commit_tests = prepare_mp_helper((task.repo, task.problem, task.commit, False))
+        prepare_args: tuple = (task.repo, task.problem, task.commit, False)
+        if task.execution_config is not None and task.execution_config.api_contexts:
+            api_context = task.execution_config.api_contexts.get(task.problem.api)
+            if api_context is not None:
+                prepare_args += (api_context,)
+        commit_tests = prepare_mp_helper(prepare_args)
         generated_tests = []
         successful_scenarios: list[TestScenario] = []
         failed_scenarios: list[dict] = []

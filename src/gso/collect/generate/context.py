@@ -3,6 +3,7 @@ from r2e.multiprocess import run_tasks_in_parallel_iter
 from gso.data import Repo, Problem, Tests, PerformanceCommit
 from gso.collect.generate.prompt import *
 from gso.collect.generate.helpers import *
+from gso.collect.generate.api_context import format_parent_api_context
 from gso.logger import logger
 
 MAX_COMMIT_TOKENS = 50000
@@ -11,7 +12,8 @@ MAX_PR_TOKENS = 20000
 
 def prepare_mp_helper(args) -> Tests:
     """Helper function to prepare test objects for a commit."""
-    repo, prob, commit, is_oversample = args
+    repo, prob, commit, is_oversample, *optional = args
+    api_context = optional[0] if optional else None
 
     if count_tokens(commit.diff_text) > MAX_COMMIT_TOKENS:
         diff_text = commit.diff_text[:MAX_COMMIT_TOKENS] + "...(truncated)..."
@@ -24,6 +26,8 @@ def prepare_mp_helper(args) -> Tests:
         commit_message=strip_empty_lines(commit.message),
         commit_diff=diff_text,
     )
+
+    context_msg += format_parent_api_context(api_context)
 
     if commit.linked_pr is not None:
         pr_messages = get_github_convo(repo, commit.linked_pr)

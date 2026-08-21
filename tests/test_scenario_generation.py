@@ -30,6 +30,7 @@ from gso.collect.execute.execute import (
     GeneratedTestExecutionConfig,
     GeneratedTestExecutionResult,
 )
+from gso.collect.generate.context import prepare_mp_helper
 from gso.collect.generate.helpers import (
     GeneratedScenarioError,
     get_generated_scenario_and_test,
@@ -133,8 +134,113 @@ def test_api_preflight_test_resolves_qualified_and_exported_apis(capsys):
     results = namespace["experiment"]()
 
     assert results["json.dumps"]["ok"] is True
+    assert results["json.dumps"]["signature"].startswith("(obj")
+    assert results["json.dumps"]["source"] is not None
+    assert "call_examples" in results["json.dumps"]
+    assert "related_types" in results["json.dumps"]
     assert results["dumps"]["ok"] is True
     assert API_PREFLIGHT_RESULT_PREFIX in capsys.readouterr().out
+
+
+def test_prepare_context_includes_exact_parent_api_metadata(monkeypatch):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commit = PerformanceCommit(
+        commit_hash="1111111234567890",
+        subject="Optimize API",
+        message="Optimize API",
+        date="2024-01-01T00:00:00",
+    )
+    problem = Problem(pid="repo-target", repo=repo, api="target", commits=[commit])
+    context = {
+        "parent_commit": "parent-sha",
+        "resolved": "repo.target",
+        "signature": "(value: Input) -> Output",
+        "source": "def target(value: Input) -> Output: ...",
+        "call_examples": [{"source_path": "tests/test_api.py", "source_line": 7}],
+        "related_types": [{"name": "repo.Input", "source": "class Input: ..."}],
+    }
+    monkeypatch.setattr(
+        PerformanceCommit, "linked_pr", property(lambda _self: None)
+    )
+
+    commit_tests = prepare_mp_helper((repo, problem, commit, False, context))
+    prompt_context = commit_tests.chat_messages[1]["content"]
+
+    assert "Exact Parent-Revision API Context" in prompt_context
+    assert '"parent_commit": "parent-sha"' in prompt_context
+    assert '"signature": "(value: Input) -> Output"' in prompt_context
+    assert "tests/test_api.py" in prompt_context
+    assert "class Input: ..." in prompt_context
+
+
+def test_prepared_preflight_keeps_context_from_successful_docker_log(
+    tmp_path, monkeypatch
+):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commit = PerformanceCommit(
+        commit_hash="1111111234567890",
+        subject="Optimize API",
+        message="Optimize API",
+        date="2024-01-01T00:00:00",
+    )
+    problem = Problem(pid="repo-target", repo=repo, api="target", commits=[commit])
+    api_context = {
+        "parent_commit": "parent-sha",
+        "resolved": "repo.target",
+        "signature": "(value: Input) -> Output",
+        "source_path": "repo/api.py",
+        "source_line": 10,
+        "source": "def target(value: Input) -> Output: ...",
+        "call_examples": [],
+        "related_types": [],
+    }
+    log_path = tmp_path / "preflight.log"
+    log_path.write_text(
+        API_PREFLIGHT_RESULT_PREFIX
+        + json.dumps({"target": {"ok": True, **api_context}})
+        + "\n"
+    )
+
+    def fake_prepare(_problem, checked_commit, config, *, session_id):
+        return GeneratedTestExecutionConfig(
+            **{
+                **config.__dict__,
+                "docker_image": "prepared-target",
+                "prepared_commit_hash": checked_commit.commit_hash,
+            }
+        )
+
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.prepare_commit_test_execution", fake_prepare
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.evaluate_generated_test",
+        lambda *_args: GeneratedTestExecutionResult(
+            passed=True, log_path=str(log_path)
+        ),
+    )
+    monkeypatch.setattr(
+        "gso.collect.generate.generate._register_prepared_execution", lambda _config: None
+    )
+
+    accepted, diagnostics, configs = prepare_and_preflight_generation_problems(
+        [problem],
+        GeneratedTestExecutionConfig(exp_id="repo"),
+        num_workers=1,
+        session_id="unit-test",
+    )
+
+    assert accepted == [problem]
+    assert diagnostics == []
+    assert configs[commit.commit_hash].api_contexts == {"target": api_context}
 
 
 def test_preflight_skips_only_unresolved_api_in_shared_commit_group(
@@ -372,7 +478,11 @@ def test_prepared_preflight_filters_api_commit_pairs_and_keeps_other_commits(
 
     def fake_evaluate(_problem, commit, _test, _config):
         if commit == commits[1]:
-            return GeneratedTestExecutionResult(passed=True)
+            report = {"good": {"ok": True, "resolved": "repo.good"}}
+            return GeneratedTestExecutionResult(
+                passed=True,
+                error=API_PREFLIGHT_RESULT_PREFIX + json.dumps(report),
+            )
         report = {
             "good": {"ok": True, "resolved": "repo.good"},
             "bad": {"ok": False, "error": "ImportError: unavailable"},

@@ -101,6 +101,7 @@ class GeneratedTestExecutionConfig:
     poll_interval: float | None = None
     phase1_only: bool = True
     prepared_commit_hash: str | None = None
+    api_contexts: dict[str, dict] | None = None
 
 
 @dataclass(frozen=True)
@@ -572,6 +573,18 @@ def prepare_generated_test_execution(
     return config
 
 
+def _execution_log_path(manager: ExecutionManager, runtime) -> str | None:
+    """Return the first persisted task log produced by an execution runtime."""
+    artifact_dir = getattr(runtime, "artifact_dir", None)
+    if artifact_dir is None:
+        return None
+    for state in manager.tasks.values():
+        candidate = Path(artifact_dir) / f"{state.cluster}.log"
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def _execution_error_detail(
     manager: ExecutionManager, runtime, manager_error: Exception | None
 ) -> tuple[str, str | None]:
@@ -583,17 +596,11 @@ def _execution_error_detail(
         if state.error:
             details.append(state.error)
 
-    log_path = None
-    artifact_dir = getattr(runtime, "artifact_dir", None)
-    if artifact_dir is not None:
-        for state in manager.tasks.values():
-            candidate = Path(artifact_dir) / f"{state.cluster}.log"
-            if not candidate.exists():
-                continue
-            log_path = str(candidate)
-            log_text = candidate.read_text(encoding="utf-8", errors="replace")
-            if log_text.strip():
-                details.append(f"Execution log tail:\n{log_text[-12000:]}")
+    log_path = _execution_log_path(manager, runtime)
+    if log_path is not None:
+        log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        if log_text.strip():
+            details.append(f"Execution log tail:\n{log_text[-12000:]}")
 
     if not details:
         details.append(
@@ -694,7 +701,10 @@ async def _async_evaluate_generated_test(
         and all(not state.failed for state in manager.tasks.values())
     )
     if passed:
-        return GeneratedTestExecutionResult(passed=True)
+        return GeneratedTestExecutionResult(
+            passed=True,
+            log_path=_execution_log_path(manager, runtime),
+        )
 
     error, log_path = _execution_error_detail(manager, runtime, manager_error)
     return GeneratedTestExecutionResult(passed=False, error=error, log_path=log_path)
