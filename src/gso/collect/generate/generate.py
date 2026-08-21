@@ -1,5 +1,6 @@
 import atexit
 import json
+from contextlib import nullcontext
 import multiprocessing as mp
 import os
 import re
@@ -33,6 +34,7 @@ from gso.collect.execute.execute import (
     GeneratedTestExecutionResult,
     cleanup_prepared_test_execution,
     evaluate_generated_test,
+    open_generated_test_validation_session,
     prepare_commit_test_execution,
     prepare_generated_test_execution,
 )
@@ -821,7 +823,7 @@ class CommitGenerationResult:
     pid: str
     commit_hash: str
     commit_tests: Tests | None = None
-    scenarios: list[dict[str, str]] = field(default_factory=list)
+    scenarios: list[str] = field(default_factory=list)
     test_outputs: list[str] = field(default_factory=list)
     test_attempts: list[dict] = field(default_factory=list)
     failed_test_slots: list[dict] = field(default_factory=list)
@@ -839,65 +841,10 @@ class CommitGenerationResult:
         }
 
 
-FAILED_SCENARIO_ERROR_MAX_CHARS = 800
-
-
-def _summarize_failed_scenario(
-    scenario: TestScenario | None, error: GeneratedTestError
-) -> dict:
-    """Compact ``{title, error}`` record for a failed scenario slot.
-
-    Full per-attempt diagnostics (raw output, execution log, full error) are kept in
-    ``CommitGenerationResult``; this summary only steers the next scenario away from
-    repeating a workload whose test was already rejected.
-    """
-    title = scenario.title if scenario is not None else "<unparsed scenario>"
-    message = str(error)
-    if len(message) > FAILED_SCENARIO_ERROR_MAX_CHARS:
-        message = message[:FAILED_SCENARIO_ERROR_MAX_CHARS] + " ...(truncated)"
-    return {"title": title, "error": message}
-
-
-def format_previous_scenarios(
-    scenarios: list[TestScenario],
-    failed_scenarios: list[dict] | None = None,
-) -> str:
-    """Format successful and failed scenarios for the next LLM request.
-
-    Successful scenarios are listed in full so the model can produce materially
-    different workloads. Failed scenarios are listed as ``{title, error}`` only, so
-    the model avoids reusing a scenario whose test was already rejected.
-    """
-    has_successful = bool(scenarios)
-    has_failed = bool(failed_scenarios)
-    if not has_successful and not has_failed:
-        return "None. This is the first scenario."
-
-    sections: list[str] = []
-    if has_successful:
-        sections.append(
-            "Successful scenarios:\n"
-            + json.dumps(
-                [scenario.model_dump() for scenario in scenarios],
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
-    if has_failed:
-        sections.append(
-            "Failed scenarios (do not reuse these; the rejection reason is shown):\n"
-            + json.dumps(failed_scenarios, indent=2, ensure_ascii=False)
-        )
-    return "\n\n".join(sections)
-
-
-def add_scenario_comment(test: str, scenario: TestScenario) -> str:
-    """Persist the scenario alongside its generated test as Python comments."""
-    lines = ["# GSO generated scenario:"]
-    for name, value in scenario.model_dump().items():
-        normalized = " ".join(value.split())
-        lines.append(f"# {name}: {normalized}")
-    return "\n".join(lines) + "\n\n" + test.lstrip()
+def add_scenario_comment(test: str, scenario: str) -> str:
+    """Persist a short scenario alongside its generated test."""
+    normalized = " ".join(scenario.split())
+    return f"# GSO generated scenario: {normalized}\n\n" + test.lstrip()
 
 
 def prepare_model_payload(
@@ -941,43 +888,78 @@ def _prepare_generation_messages(
     return messages
 
 
-def _prepare_semantic_retry(
-    args: PerfExpGenArgs,
-    payload: list[dict[str, str]],
-    *,
-    retry_number: int,
-    previous_error: GeneratedTestError | None,
-    output_requirement: str,
-) -> tuple[PerfExpGenArgs, list[dict[str, str]]]:
-    """Prepare a cache-bypassing request that corrects an invalid completion."""
-    if retry_number == 0:
-        return args, payload
-    if previous_error is None:
-        raise ValueError("A semantic retry requires the previous validation error")
+@dataclass
+class BatchTestSlotState:
+    """Latest generated candidate and validation state for one stable slot."""
 
-    retry_instruction = (
-        "Automated validation rejected the previous completion:\n"
-        f"{previous_error}\n\n"
-        f"This is semantic retry {retry_number} of "
-        f"{SEMANTIC_RETRY_COUNT}. Regenerate the complete response from "
-        f"scratch. {output_requirement}"
+    slot: int
+    attempts: int = 0
+    status: str = "pending"
+    scenario: str | None = None
+    code: str | None = None
+    generated_test: str | None = None
+    error: str | None = None
+    execution_log: str | None = None
+
+
+def _batch_generation_state(states: dict[int, BatchTestSlotState]) -> str:
+    """Return all successful and failed latest tests for a repair request."""
+    successful_tests = []
+    failed_tests = []
+    for slot in sorted(states):
+        state = states[slot]
+        item = {
+            "slot": slot,
+            "scenario": state.scenario,
+            "code": state.code,
+        }
+        if state.status == "accepted":
+            successful_tests.append(item)
+        else:
+            failed_tests.append(
+                {
+                    **item,
+                    "attempt": state.attempts,
+                    "failure": {
+                        "summary": state.error or "No valid test was returned",
+                        "execution_log": state.execution_log,
+                    },
+                }
+            )
+    return json.dumps(
+        {
+            "successful_tests": successful_tests,
+            "failed_tests": failed_tests,
+        },
+        indent=2,
+        ensure_ascii=False,
     )
-    retry_payload = [dict(message) for message in payload]
-    user_message = next(
-        (message for message in retry_payload if message["role"] == "user"), None
+
+
+def _record_batch_attempt(
+    result: CommitGenerationResult,
+    state: BatchTestSlotState,
+    *,
+    round_number: int,
+    error: str | None,
+) -> None:
+    result.test_attempts.append(
+        {
+            "scenario_index": state.slot,
+            "slot": state.slot,
+            "retry_number": round_number,
+            "attempt": state.attempts,
+            "scenario": state.scenario,
+            "code": state.code,
+            "raw_output": None,
+            "error": error,
+            "execution_log": state.execution_log,
+        }
     )
-    if user_message is None:
-        retry_payload.append({"role": "user", "content": retry_instruction})
-    else:
-        user_message["content"] += f"\n\n{retry_instruction}"
-    # A failed first attempt may already be cached. Retrying without cache ensures
-    # that validation does not repeatedly receive the same invalid completion.
-    retry_args = args.model_copy(update={"use_cache": False})
-    return retry_args, retry_payload
 
 
 def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
-    """Generate, execute, and accept one scenario/test at a time for a commit."""
+    """Generate tests in batches and repair only failed stable slots."""
     generation_started = time.monotonic()
     llm_seconds = 0.0
     validation_seconds = 0.0
@@ -987,6 +969,10 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
         pid=task.problem.pid,
         commit_hash=task.commit.commit_hash,
     )
+    states = {
+        slot: BatchTestSlotState(slot=slot)
+        for slot in range(1, task.args.n + 1)
+    }
 
     try:
         prepare_args: tuple = (task.repo, task.problem, task.commit, False)
@@ -995,220 +981,293 @@ def generate_commit_tests(task: CommitGenerationTask) -> CommitGenerationResult:
             if api_context is not None:
                 prepare_args += (api_context,)
         commit_tests = prepare_mp_helper(prepare_args)
-        generated_tests = []
-        successful_scenarios: list[TestScenario] = []
-        failed_scenarios: list[dict] = []
-        for scenario_index in range(1, task.args.n + 1):
-            slot_status = "skipped"
-            combined_task = SCENARIO_TEST_MSG.format(
-                api=task.problem.api,
-                repo_name=task.repo.repo_name,
-                scenario_number=scenario_index,
-                scenario_count=task.args.n,
-                previous_scenarios=format_previous_scenarios(
-                    successful_scenarios, failed_scenarios
-                ),
+
+        session_context = (
+            open_generated_test_validation_session(
+                task.problem,
+                task.commit,
+                task.execution_config,
             )
-            if task.repo.repo_instr:
-                combined_task += (
-                    "\n\nRepo-specific Instructions:\n" f"{task.repo.repo_instr}\n"
+            if task.execution_config is not None
+            else nullcontext(None)
+        )
+        with session_context as validation_session:
+            for round_number in range(SEMANTIC_RETRY_COUNT + 1):
+                pending_slots = [
+                    slot
+                    for slot, state in states.items()
+                    if state.status == "pending"
+                    and state.attempts < SEMANTIC_RETRY_COUNT + 1
+                ]
+                if not pending_slots:
+                    break
+
+                if round_number == 0:
+                    task_message = BATCH_SCENARIO_TEST_MSG.format(
+                        api=task.problem.api,
+                        repo_name=task.repo.repo_name,
+                        test_count=len(pending_slots),
+                        slot_list=pending_slots,
+                    )
+                else:
+                    task_message = REPAIR_BATCH_TEST_MSG.format(
+                        api=task.problem.api,
+                        repo_name=task.repo.repo_name,
+                        generation_state=_batch_generation_state(states),
+                        first_slot=pending_slots[0],
+                        failed_count=len(pending_slots),
+                        failed_slots=pending_slots,
+                    )
+                if task.repo.repo_instr:
+                    task_message += (
+                        "\n\nRepo-specific Instructions:\n"
+                        f"{task.repo.repo_instr}\n"
+                    )
+
+                messages = _prepare_generation_messages(
+                    commit_tests.chat_messages, task_message
                 )
-            combined_messages = _prepare_generation_messages(
-                commit_tests.chat_messages, combined_task
-            )
-            combined_payload = prepare_model_payload(
-                task.args.model_name, combined_messages
-            )
-            test_context = (
-                f"{task.problem.pid}/{task.commit.quick_hash()} "
-                f"scenario/test {scenario_index}"
-            )
-            event_context = (
-                f"target {task.target_index + 1}/{task.target_count} | "
-                f"{task.problem.pid}/{task.commit.quick_hash()} | "
-                f"test {scenario_index}/{task.args.n} |"
-            )
-            test_error: GeneratedTestError | None = None
-            for retry_number in range(SEMANTIC_RETRY_COUNT + 1):
-                execution_log = None
-                scenario = None
-                request_args, attempt_payload = _prepare_semantic_retry(
-                    task.args,
-                    combined_payload,
-                    retry_number=retry_number,
-                    previous_error=test_error,
-                    output_requirement=(
-                        "Return the complete response from scratch: exactly one JSON "
-                        "scenario block followed by exactly one complete Python test "
-                        "block, with no explanations outside the blocks. The scenario "
-                        "may change from the rejected attempt."
-                    ),
+                payload = prepare_model_payload(task.args.model_name, messages)
+                request_args = (
+                    task.args
+                    if round_number == 0
+                    else task.args.model_copy(update={"use_cache": False})
                 )
+                event_context = (
+                    f"target {task.target_index + 1}/{task.target_count} | "
+                    f"{task.problem.pid}/{task.commit.quick_hash()} | "
+                    f"batch {round_number + 1}/{SEMANTIC_RETRY_COUNT + 1} |"
+                )
+                for slot in pending_slots:
+                    states[slot].attempts += 1
+
                 raw_output = None
                 try:
-                    if retry_number == 0:
-                        log_generation_event(event_context, "requesting test")
-                    else:
-                        log_generation_event(
-                            event_context,
-                            f"re-requesting test (semantic retry "
-                            f"{retry_number}/{SEMANTIC_RETRY_COUNT})",
-                        )
+                    action = (
+                        f"requesting {len(pending_slots)} tests"
+                        if round_number == 0
+                        else f"requesting repairs for slots {pending_slots}"
+                    )
+                    log_generation_event(event_context, action)
+                    completion_started = time.monotonic()
                     try:
-                        completion_started = time.monotonic()
-                        try:
-                            raw_output = get_llm_completion(
-                                request_args,
-                                attempt_payload,
-                                stream=request_args.stream,
-                            )
-                        finally:
-                            llm_seconds += time.monotonic() - completion_started
-                    except Exception as completion_exception:
-                        raise GeneratedTestError(
-                            f"{test_context}: LLM completion raised "
-                            f"{type(completion_exception).__name__}: "
-                            f"{completion_exception}"
-                        ) from completion_exception
+                        raw_output = get_llm_completion(
+                            request_args,
+                            payload,
+                            stream=request_args.stream,
+                        )
+                    finally:
+                        llm_seconds += time.monotonic() - completion_started
                     result.test_outputs.append(raw_output)
-                    scenario, generated_test = get_generated_scenario_and_test(
-                        raw_output, context=test_context
+                    parsed_batch = parse_generated_test_batch(
+                        raw_output,
+                        expected_slots=set(pending_slots),
+                        context=(
+                            f"{task.problem.pid}/{task.commit.quick_hash()} "
+                            f"generation batch {round_number + 1}"
+                        ),
                     )
-                    generated_test = add_scenario_comment(
-                        generated_test,
-                        scenario,
+                except Exception as error:
+                    detail = (
+                        f"LLM batch generation failed: {type(error).__name__}: {error}"
                     )
-                    if task.execution_config is not None:
+                    for slot in pending_slots:
+                        state = states[slot]
+                        state.error = detail
+                        state.execution_log = None
+                        _record_batch_attempt(
+                            result,
+                            state,
+                            round_number=round_number,
+                            error=detail,
+                        )
+                    parsed_batch = None
+
+                runnable: list[BatchTestSlotState] = []
+                if parsed_batch is not None:
+                    accepted_scenarios = {
+                        " ".join(state.scenario.split()).casefold()
+                        for state in states.values()
+                        if state.status == "accepted" and state.scenario
+                    }
+                    accepted_codes = {
+                        state.code.strip()
+                        for state in states.values()
+                        if state.status == "accepted" and state.code
+                    }
+                    for slot in pending_slots:
+                        state = states[slot]
+                        parse_error = parsed_batch.errors.get(slot)
+                        if parse_error is not None:
+                            state.error = parse_error
+                            state.execution_log = None
+                            _record_batch_attempt(
+                                result,
+                                state,
+                                round_number=round_number,
+                                error=parse_error,
+                            )
+                            continue
+
+                        item = parsed_batch.items[slot]
+                        state.scenario = item.scenario
+                        state.code = item.code
+                        state.execution_log = None
+                        normalized_scenario = " ".join(
+                            item.scenario.split()
+                        ).casefold()
+                        normalized_code = item.code.strip()
+                        if normalized_scenario in accepted_scenarios:
+                            validation_error = (
+                                f"slot {slot}: scenario duplicates an accepted test"
+                            )
+                        elif normalized_code in accepted_codes:
+                            validation_error = (
+                                f"slot {slot}: code duplicates an accepted test"
+                            )
+                        else:
+                            try:
+                                validate_generated_test(
+                                    item.code,
+                                    context=f"slot {slot} generated test",
+                                )
+                            except GeneratedTestError as error:
+                                validation_error = str(error)
+                            else:
+                                validation_error = None
+
+                        if validation_error is not None:
+                            state.error = validation_error
+                            _record_batch_attempt(
+                                result,
+                                state,
+                                round_number=round_number,
+                                error=validation_error,
+                            )
+                            continue
+                        state.generated_test = add_scenario_comment(
+                            item.code, item.scenario
+                        )
+                        accepted_scenarios.add(normalized_scenario)
+                        accepted_codes.add(normalized_code)
+                        runnable.append(state)
+
+                for state in runnable:
+                    slot_context = (
+                        f"target {task.target_index + 1}/{task.target_count} | "
+                        f"{task.problem.pid}/{task.commit.quick_hash()} | "
+                        f"test {state.slot}/{task.args.n} |"
+                    )
+                    execution_error = None
+                    if validation_session is not None:
                         log_generation_event(
-                            event_context,
-                            f"starting test (attempt {retry_number + 1}/"
+                            slot_context,
+                            f"starting test (attempt {state.attempts}/"
                             f"{SEMANTIC_RETRY_COUNT + 1})",
                         )
+                        validation_started = time.monotonic()
                         try:
-                            validation_started = time.monotonic()
-                            try:
-                                execution_result = evaluate_generated_test(
-                                    task.problem,
-                                    task.commit,
-                                    generated_test,
-                                    task.execution_config,
+                            execution_result = validation_session.validate(
+                                state.generated_test,
+                                slot=state.slot,
+                                attempt=state.attempts,
+                            )
+                        except Exception as error:
+                            execution_error = (
+                                "Automated execution raised "
+                                f"{type(error).__name__}: {error}"
+                            )
+                        else:
+                            state.execution_log = execution_result.log_path
+                            if not execution_result.passed:
+                                execution_error = execution_result.error or (
+                                    "Generated test execution failed without diagnostics"
                                 )
-                            finally:
-                                validation_seconds += (
-                                    time.monotonic() - validation_started
-                                )
-                        except Exception as execution_exception:
-                            log_generation_event(
-                                event_context,
-                                "test failed "
-                                f"({type(execution_exception).__name__}: "
-                                f"{execution_exception})",
-                            )
-                            raise GeneratedTestError(
-                                f"{test_context}: automated execution raised "
-                                f"{type(execution_exception).__name__}: "
-                                f"{execution_exception}"
-                            ) from execution_exception
-                        execution_log = execution_result.log_path
-                        if not execution_result.passed:
-                            execution_error = execution_result.error or (
-                                "Generated test execution failed without diagnostics"
-                            )
-                            log_generation_event(
-                                event_context,
-                                "test failed"
-                                + (
-                                    f" (log: {execution_log})"
-                                    if execution_log is not None
-                                    else ""
-                                ),
-                            )
-                            raise GeneratedTestError(
-                                f"{test_context}: automated execution failed:\n"
-                                f"{execution_error}"
-                            )
-                        log_generation_event(event_context, "test passed")
-                except GeneratedTestError as error:
-                    attempt = {
-                        "scenario_index": scenario_index,
-                        "retry_number": retry_number,
-                        "scenario": scenario.model_dump() if scenario else None,
-                        "raw_output": raw_output,
-                        "error": str(error),
-                        "execution_log": execution_log,
-                    }
-                    result.test_attempts.append(attempt)
-                    if retry_number == SEMANTIC_RETRY_COUNT:
-                        result.failed_test_slots.append(
-                            {
-                                "scenario_index": scenario_index,
-                                "error": str(error),
-                                "execution_log": execution_log,
-                            }
+                        finally:
+                            validation_seconds += time.monotonic() - validation_started
+
+                    if execution_error is not None:
+                        state.error = execution_error
+                        log_generation_event(
+                            slot_context,
+                            "test failed"
+                            + (
+                                f" (log: {state.execution_log})"
+                                if state.execution_log
+                                else ""
+                            ),
                         )
-                        failed_scenarios.append(
-                            _summarize_failed_scenario(scenario, error)
+                        _record_batch_attempt(
+                            result,
+                            state,
+                            round_number=round_number,
+                            error=execution_error,
                         )
-                        logger.error(
-                            "%s failed after the initial request and %d semantic "
-                            "retries; skipping this test slot",
-                            test_context,
-                            SEMANTIC_RETRY_COUNT,
-                        )
-                        break
-                    logger.warning(
-                        "%s failed validation; semantic retry %d/%d: %s",
-                        test_context,
-                        retry_number + 1,
-                        SEMANTIC_RETRY_COUNT,
-                        error,
+                        continue
+
+                    state.status = "accepted"
+                    state.error = None
+                    log_generation_event(slot_context, "test passed")
+                    _record_batch_attempt(
+                        result,
+                        state,
+                        round_number=round_number,
+                        error=None,
                     )
-                    test_error = error
-                    continue
-                result.test_attempts.append(
-                    {
-                        "scenario_index": scenario_index,
-                        "retry_number": retry_number,
-                        "scenario": scenario.model_dump(),
-                        "raw_output": raw_output,
-                        "error": None,
-                        "execution_log": execution_log,
-                    }
+
+                for slot in pending_slots:
+                    state = states[slot]
+                    if (
+                        state.status != "accepted"
+                        and state.attempts >= SEMANTIC_RETRY_COUNT + 1
+                    ):
+                        state.status = "exhausted"
+
+                accepted_count = sum(
+                    state.status == "accepted" for state in states.values()
                 )
-                generated_tests.append(generated_test)
-                successful_scenarios.append(scenario)
-                slot_status = "accepted"
-                break
+                exhausted_count = sum(
+                    state.status == "exhausted" for state in states.values()
+                )
+                elapsed_seconds = time.monotonic() - generation_started
+                print(
+                    f"{GENERATION_PROGRESS_PREFIX} "
+                    f"target {task.target_index + 1}/{task.target_count} | "
+                    f"{task.problem.pid}/{task.commit.quick_hash()} | "
+                    f"batch {round_number + 1}/{SEMANTIC_RETRY_COUNT + 1} | "
+                    f"requested={len(pending_slots)} | accepted={accepted_count} | "
+                    f"exhausted={exhausted_count} | "
+                    f"elapsed={elapsed_seconds:.1f}s | llm={llm_seconds:.1f}s | "
+                    f"validation={validation_seconds:.1f}s",
+                    flush=True,
+                )
 
-            semantic_retries = sum(
-                attempt["retry_number"] > 0 for attempt in result.test_attempts
-            )
-            slot_completion = (
-                " | slots complete" if scenario_index == task.args.n else ""
-            )
-            elapsed_seconds = time.monotonic() - generation_started
-            print(
-                f"{GENERATION_PROGRESS_PREFIX} "
-                f"target {task.target_index + 1}/{task.target_count} | "
-                f"{task.problem.pid}/{task.commit.quick_hash()} | "
-                f"test {scenario_index}/{task.args.n} {slot_status} | "
-                f"accepted={len(generated_tests)} | "
-                f"skipped={len(result.failed_test_slots)} | "
-                f"semantic_retries={semantic_retries} | "
-                f"elapsed={elapsed_seconds:.1f}s | "
-                f"llm={llm_seconds:.1f}s | "
-                f"validation={validation_seconds:.1f}s{slot_completion}",
-                flush=True,
-            )
-
-        result.scenarios = [scenario.model_dump() for scenario in successful_scenarios]
-
-        if not generated_tests:
+        accepted_states = [
+            states[slot]
+            for slot in sorted(states)
+            if states[slot].status == "accepted"
+        ]
+        result.scenarios = [state.scenario for state in accepted_states]
+        result.failed_test_slots = [
+            {
+                "scenario_index": state.slot,
+                "slot": state.slot,
+                "attempts": state.attempts,
+                "scenario": state.scenario,
+                "error": state.error,
+                "execution_log": state.execution_log,
+            }
+            for state in states.values()
+            if state.status != "accepted"
+        ]
+        if not accepted_states:
             raise GeneratedTestError(
                 f"{task.problem.pid}/{task.commit.quick_hash()}: no valid tests were "
                 f"generated after attempting {task.args.n} test slot(s)"
             )
-        commit_tests.add_samples(generated_tests)
+        commit_tests.add_samples(
+            [state.generated_test for state in accepted_states]
+        )
         result.commit_tests = commit_tests
     except Exception:
         result.error = traceback.format_exc()
@@ -1663,7 +1722,7 @@ class PerfExpGenerator:
         print(
             f"Generating {len(problems)} problems for {len(commit_tasks)} "
             f"API/commit task(s) across {generation_commit_count} commit(s) "
-            f"(tests_per_commit={args.n}, choices_per_request=1, "
+            f"(tests_per_commit={args.n}, tests_per_initial_request={args.n}, "
             f"commit_workers={commit_workers}, max_tokens={args.max_tokens}, "
             f"stream={args.stream})"
         )

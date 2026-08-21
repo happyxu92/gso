@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import functools
 import re
+import shlex
 import threading
 import time
 import uuid
@@ -111,6 +112,184 @@ class GeneratedTestExecutionResult:
     passed: bool
     error: str | None = None
     log_path: str | None = None
+
+
+class GeneratedTestValidationSession:
+    """One persistent Docker container for serial tests of an API/commit task."""
+
+    def __init__(
+        self,
+        problem: Problem,
+        commit: PerformanceCommit,
+        config: GeneratedTestExecutionConfig,
+        runtime: DockerManager,
+    ) -> None:
+        if config.backend != "docker":
+            raise ValueError("Persistent generated-test validation requires Docker")
+        if config.prepared_commit_hash is None:
+            raise ValueError(
+                "Persistent generated-test validation requires a prepared commit image"
+            )
+        if (
+            config.prepared_commit_hash is not None
+            and config.prepared_commit_hash != commit.commit_hash
+        ):
+            raise ValueError(
+                "Prepared Docker image candidate mismatch: "
+                f"expected {config.prepared_commit_hash}, got {commit.commit_hash}"
+            )
+        self.problem = problem
+        self.commit = commit
+        self.config = config
+        self.runtime = runtime
+        safe_pid = re.sub(r"[^a-z0-9-]+", "-", problem.pid.lower()).strip("-")
+        self.container = (
+            f"docker-gso-{(safe_pid or 'test')[:24]}-"
+            f"{commit.quick_hash()}-{uuid.uuid4().hex[:8]}"
+        )
+        self.closed = False
+        self.runtime.start_validation_container(self.container)
+        health_error = self._health_error()
+        if health_error is not None:
+            self.close()
+            raise RuntimeError(health_error)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _health_error(self) -> str | None:
+        if not self.runtime.validation_container_running(self.container):
+            return "Docker validation container is not running"
+        repo_dir = f"/workspace/{self.problem.repo.repo_name}"
+        candidate = shlex.quote(self.commit.commit_hash)
+        command = (
+            "set -e\n"
+            f"repo={shlex.quote(repo_dir)}\n"
+            f"candidate=$(git -C \"$repo\" rev-parse {candidate}^{{commit}})\n"
+            f"parent=$(git -C \"$repo\" rev-parse {candidate}^)\n"
+            "test \"$(git -C \"$repo\" rev-parse HEAD)\" = \"$parent\"\n"
+            "test \"$(cat /gso-prepared-candidate)\" = \"$candidate\"\n"
+            "command -v python >/dev/null"
+        )
+        completed = self.runtime.exec_validation_command(self.container, command)
+        if completed.returncode == 0:
+            return None
+        detail = (completed.stderr or completed.stdout).strip()
+        return "Prepared Docker validation environment is unhealthy" + (
+            f": {detail}" if detail else ""
+        )
+
+    def _restart(self) -> None:
+        self.runtime.cleanup_cluster(self.container)
+        self.runtime.start_validation_container(self.container)
+        health_error = self._health_error()
+        if health_error is not None:
+            raise RuntimeError(health_error)
+
+    def validate(
+        self,
+        generated_test: str,
+        *,
+        slot: int,
+        attempt: int,
+    ) -> GeneratedTestExecutionResult:
+        """Run one test process in an isolated directory in the shared container."""
+        validation_problem = self.problem.model_copy(deep=True)
+        validation_problem.commits = [self.commit]
+        commit_tests = Tests.from_commit(self.commit)
+        commit_tests.add_sample(generated_test)
+        validation_problem.set_tests([commit_tests])
+        validation_problem.clear_results()
+        validate_problem_test_samples([validation_problem])
+
+        workspace = Path(
+            self.runtime.create_workspace(
+                validation_problem,
+                phase1_only=True,
+                test_timeout=300,
+            )
+        )
+        destination = f"/gso-validation/slot-{slot}/attempt-{attempt}"
+        try:
+            for infrastructure_attempt in range(2):
+                if not self.runtime.validation_container_running(self.container):
+                    self._restart()
+                self.runtime.copy_validation_workspace(
+                    self.container, workspace, destination
+                )
+                command = (
+                    "set +e\n"
+                    f"cd {shlex.quote(destination)}\n"
+                    f"ln -sfn /workspace/{shlex.quote(self.problem.repo.repo_name)} "
+                    f"{shlex.quote(self.problem.repo.repo_name)}\n"
+                    f"export COMMITS={shlex.quote(self.commit.quick_hash())}\n"
+                    "chmod +x phase1.sh\n"
+                    "./phase1.sh"
+                )
+                completed = self.runtime.exec_validation_command(
+                    self.container, command
+                )
+                if self.runtime.validation_container_running(self.container):
+                    break
+                if infrastructure_attempt == 0:
+                    self._restart()
+                    continue
+                raise RuntimeError(
+                    "Docker validation container stopped during test execution"
+                )
+
+            artifact_dir = Path(self.runtime.artifact_dir)
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            log_path = artifact_dir / (
+                f"{self.problem.pid}_{self.commit.quick_hash()}_"
+                f"slot_{slot}_attempt_{attempt}.log"
+            )
+            log_text = (completed.stdout or "") + (completed.stderr or "")
+            log_path.write_text(log_text, encoding="utf-8")
+
+            health_error = self._health_error()
+            if health_error is not None:
+                self._restart()
+                return GeneratedTestExecutionResult(
+                    passed=False,
+                    error=(
+                        "Generated test damaged the shared validation environment: "
+                        f"{health_error}"
+                    ),
+                    log_path=str(log_path),
+                )
+            if completed.returncode == 0:
+                return GeneratedTestExecutionResult(
+                    passed=True,
+                    log_path=str(log_path),
+                )
+            detail = log_text[-12000:].strip()
+            return GeneratedTestExecutionResult(
+                passed=False,
+                error=(
+                    f"Generated test exited with code {completed.returncode}"
+                    + (f"\nExecution log tail:\n{detail}" if detail else "")
+                ),
+                log_path=str(log_path),
+            )
+        finally:
+            if self.config.keep_workspaces:
+                print(
+                    f"Kept validation workspace for {self.problem.pid} "
+                    f"slot {slot} attempt {attempt}: {workspace}",
+                    flush=True,
+                )
+            else:
+                self.runtime.cleanup_workspace(workspace)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.runtime.close_validation_container(self.container)
 
 
 class ExecutionManager:
@@ -488,6 +667,17 @@ def _create_runtime(config: GeneratedTestExecutionConfig, exp_dir: Path):
     if config.backend == "sky":
         return SkyManager()
     raise ValueError("backend must be 'sky' or 'docker'")
+
+
+def open_generated_test_validation_session(
+    problem: Problem,
+    commit: PerformanceCommit,
+    config: GeneratedTestExecutionConfig,
+) -> GeneratedTestValidationSession:
+    """Open one Docker container reused by all serial test-validation rounds."""
+    exp_dir = EXPS_DIR / config.exp_id
+    runtime = _create_runtime(config, exp_dir)
+    return GeneratedTestValidationSession(problem, commit, config, runtime)
 
 
 def prepare_commit_test_execution(

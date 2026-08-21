@@ -3,6 +3,7 @@ import json
 import os
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import tiktoken
 from ghapi.core import GhApi
@@ -96,7 +97,7 @@ class GeneratedScenarioError(GeneratedTestError):
 
 
 class TestScenario(BaseModel):
-    """Structured plan used to generate one performance test."""
+    """Legacy structured scenario retained for cached completion compatibility."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -107,6 +108,28 @@ class TestScenario(BaseModel):
     optimization_focus: str = Field(min_length=1)
     equivalence_strategy: str = Field(min_length=1)
     distinguishing_factor: str = Field(min_length=1)
+
+
+class GeneratedTestItem(BaseModel):
+    """One slot in a batched test-generation response."""
+
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        extra="forbid",
+        strict=True,
+    )
+
+    slot: int = Field(ge=1)
+    scenario: str = Field(min_length=1, max_length=300)
+    code: str = Field(min_length=1)
+
+
+@dataclass(frozen=True)
+class ParsedGeneratedTestBatch:
+    """Individually parsed items plus slot-specific response errors."""
+
+    items: dict[int, GeneratedTestItem]
+    errors: dict[int, str]
 
 
 def _format_validation_errors(title: str, errors: list[str]) -> str:
@@ -151,6 +174,71 @@ def extract_json_block(output: str, *, context: str = "scenario response") -> st
     if not content:
         raise GeneratedScenarioError(f"{context}: extracted JSON is empty")
     return content
+
+
+def parse_generated_test_batch(
+    output: str,
+    *,
+    expected_slots: set[int],
+    context: str = "batched test response",
+) -> ParsedGeneratedTestBatch:
+    """Parse a JSON batch while preserving valid, uniquely addressed slots."""
+    content = extract_json_block(output, context=context)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise GeneratedScenarioError(
+            f"{context}: invalid JSON at line {exc.lineno}, column {exc.colno}: "
+            f"{exc.msg}"
+        ) from exc
+
+    if not isinstance(parsed, dict) or set(parsed) != {"tests"}:
+        raise GeneratedScenarioError(
+            f"{context}: expected an object containing only the 'tests' field"
+        )
+    raw_tests = parsed["tests"]
+    if not isinstance(raw_tests, list):
+        raise GeneratedScenarioError(f"{context}: 'tests' must be a JSON array")
+    raw_slots = [
+        item.get("slot")
+        for item in raw_tests
+        if isinstance(item, dict) and isinstance(item.get("slot"), int)
+    ]
+    unexpected_slots = sorted(set(raw_slots) - expected_slots)
+    if unexpected_slots:
+        raise GeneratedScenarioError(
+            f"{context}: returned unrequested slot(s): {unexpected_slots}; "
+            f"expected exactly {sorted(expected_slots)}"
+        )
+    if len(raw_tests) > len(expected_slots):
+        raise GeneratedScenarioError(
+            f"{context}: expected at most {len(expected_slots)} item(s), "
+            f"got {len(raw_tests)}"
+        )
+
+    duplicate_slots = {slot for slot in raw_slots if raw_slots.count(slot) > 1}
+    items: dict[int, GeneratedTestItem] = {}
+    errors: dict[int, str] = {}
+    for raw_item in raw_tests:
+        raw_slot = raw_item.get("slot") if isinstance(raw_item, dict) else None
+        if raw_slot in duplicate_slots:
+            errors[raw_slot] = f"{context}: slot {raw_slot} was returned more than once"
+            continue
+        try:
+            item = GeneratedTestItem.model_validate(raw_item)
+        except ValidationError as exc:
+            if raw_slot in expected_slots:
+                errors[raw_slot] = (
+                    f"{context}: invalid item for slot {raw_slot}: {exc}"
+                )
+            continue
+        if item.slot in expected_slots:
+            items[item.slot] = item
+
+    for slot in expected_slots:
+        if slot not in items and slot not in errors:
+            errors[slot] = f"{context}: required slot {slot} is missing or invalid"
+    return ParsedGeneratedTestBatch(items=items, errors=errors)
 
 
 def get_generated_scenario_and_test(

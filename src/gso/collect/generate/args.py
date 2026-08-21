@@ -22,14 +22,14 @@ class PerfExpGenArgs(LLMArgs):
         5,
         ge=1,
         description=(
-            "Number of scenarios/tests generated per commit. Each scenario is "
-            "planned, generated, and executed before the next one is requested."
+            "Number of stable test slots generated in one initial batch per commit. "
+            "Later requests repair only slots that have not passed validation."
         ),
     )
     max_tokens: int = Field(
         DEFAULT_GENERATION_MAX_TOKENS,
         ge=1,
-        description="Maximum output tokens per generated performance test.",
+        description="Maximum output tokens shared by one generated test batch.",
     )
     openai_timeout: int = Field(
         DEFAULT_GENERATION_OPENAI_TIMEOUT,

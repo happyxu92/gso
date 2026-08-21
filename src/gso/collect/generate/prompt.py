@@ -100,7 +100,7 @@ if __name__ == '__main__':
 - The output should be a complete Python script that must contain an entry point: `run_test()` with the following signature:
     ```def run_test(eqcheck: bool = False, reference: bool = False, prefix: str = '') -> float:```
 - Do not write the main function as your code will be automatically appended with the harness
-- YOU MUST put your final script in a code block. e.g., ```python\n<your code here>\n```
+- Follow the output contract in the task message. When the task requests JSON, put each complete script in the JSON `code` string and do not use Markdown fences.
 """
 
 CONTEXT_MSG = """Here's a commit and it's information that does some optimization for the {api} API in the {repo_name} repository that might be relevant to writing the test:
@@ -121,48 +121,68 @@ PR_INFO = """
 """
 
 
-SCENARIO_TEST_MSG = """Create one benchmark scenario and its complete Python test for `{api}` in `{repo_name}`.
+BATCH_SCENARIO_TEST_MSG = """Create exactly {test_count} materially different benchmark scenarios and complete Python tests for `{api}` in `{repo_name}`.
 
 ## Scenario selection
-- Study the supplied commit message and diff first. Exercise the behavior or data path the optimization changes, not merely the same API name.
-- The test runs on the parent commit, so use only APIs and behavior available before the optimization.
-- Choose one realistic, non-trivial workload. It must differ materially from every previous successful or failed scenario in workload shape, data distribution, scale, API path, or optimized behavior; changing only arbitrary values is insufficient.
-- Do not reuse a failed scenario. Avoid uniform, sorted, repeating, or otherwise easily special-cased inputs.
+- Study the supplied commit message, diff, and parent-revision API context first. Exercise behavior or data paths changed by the optimization, not merely the same API name.
+- All tests run on the parent commit, so use only APIs and behavior available before the optimization.
+- Make the scenarios differ materially in workload shape, data distribution, scale, API path, or optimized behavior. Changing only arbitrary values is insufficient.
+- Use realistic, non-trivial, deterministic inputs. Avoid uniform, sorted, repeating, or easily special-cased data.
+- Keep each `scenario` to one short sentence.
 
 ## Test implementation
-- Implement exactly the workload described by the scenario, and call the target API on the timed path.
-- Keep downloads, data construction, and other setup outside `experiment`; time only the workload of interest.
-- Make inputs deterministic and reproducible while retaining realistic diversity.
-- Store enough output to compare the current result with the reference, and make `check_equivalence` sensitive to meaningful incorrect results.
-- Target roughly 1–60 seconds for one parent-commit `experiment` run, ideally 1–30 seconds and safely below the ~300-second timeout. Include the chosen data size and estimated parent runtime in `input_characteristics`; reduce data volume rather than realism if necessary.
-- Follow every function, timing, and harness requirement in the system message.
+- Every `code` value must be a complete standalone test satisfying every function, timing, equivalence, and harness requirement in the system message.
+- Implement exactly the workload described by that item's scenario and call the target API on the timed path.
+- Keep downloads, data construction, and other setup outside `experiment`.
+- Target roughly 1–60 seconds for one parent-commit experiment, ideally 1–30 seconds.
+- Do not install packages, modify the repository checkout, or depend on files produced by another test slot.
 
 ## Output contract
-Return exactly two fenced blocks and no other text.
-
-First, return one `json` block with exactly these string fields:
-```json
+Return only one valid JSON object, with no Markdown fences or explanatory text:
 {{
-  "title": "short scenario name",
-  "workload": "realistic operation and data setup",
-  "input_characteristics": "input structure, distribution, and scale",
-  "api_usage": "how the target API is exercised",
-  "optimization_focus": "commit behavior this scenario measures",
-  "equivalence_strategy": "what result is stored and compared",
-  "distinguishing_factor": "how this differs materially from all previous scenarios"
+  "tests": [
+    {{
+      "slot": 1,
+      "scenario": "One short scenario description.",
+      "code": "import timeit\\n\\n# complete test implementation"
+    }}
+  ]
 }}
-```
 
-Second, return one `python` block containing the complete runnable test with every required function:
-```python
-# complete test implementation
-```
+Requirements:
+- `tests` must contain exactly {test_count} items.
+- `slot` values must be exactly {slot_list}, each appearing once.
+- Each item must contain only `slot`, `scenario`, and `code`.
+- Encode each complete Python script as a valid JSON string. Do not put Markdown fences inside `code`.
+"""
+
+
+REPAIR_BATCH_TEST_MSG = """Repair the failed benchmark test slots for `{api}` in `{repo_name}`.
+
+The JSON generation state below contains every successful test and every failed test. Successful tests are immutable references: use them to avoid duplicate scenarios, but do not return or modify them. For each failed test, study its complete code and validation failure, then return a complete replacement test. You may change its scenario when the original workload is not viable.
 
 ## Generation state
-This is scenario {scenario_number} of {scenario_count}.
+{generation_state}
 
-Previous scenarios (successful plans are complete; failed entries include their rejection reason):
-{previous_scenarios}
+## Output contract
+Return only one valid JSON object, with no Markdown fences or explanatory text:
+{{
+  "tests": [
+    {{
+      "slot": {first_slot},
+      "scenario": "One short revised scenario description.",
+      "code": "import timeit\\n\\n# complete replacement test"
+    }}
+  ]
+}}
+
+Requirements:
+- Return exactly {failed_count} items.
+- Return exactly failed slots {failed_slots}, each appearing once.
+- Do not return successful slots.
+- Return complete replacement code, never a patch or diff.
+- Each item must contain only `slot`, `scenario`, and `code`.
+- All code must satisfy the system message, run on the parent commit, avoid package installation and repository modification, and remain independent of other slots.
 """
 
 

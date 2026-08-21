@@ -149,6 +149,70 @@ def test_launch_task_mounts_persistent_build_and_package_cache(tmp_path, monkeyp
     assert (cache_dir / "ccache").is_dir()
 
 
+def test_validation_container_is_started_once_and_executes_serial_commands(
+    tmp_path, monkeypatch
+):
+    manager = DockerManager(
+        image="gso-prepared:latest",
+        artifact_dir=tmp_path / "artifacts",
+        cache_dir=tmp_path / "cache",
+    )
+    commands = []
+
+    def fake_run(command, *, check=True, capture_output=False):
+        commands.append(command)
+        if command[:3] == ["docker", "container", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(manager, "_run", fake_run)
+
+    manager.start_validation_container("docker-gso-validation-test")
+    first = manager.exec_validation_command(
+        "docker-gso-validation-test", "echo first"
+    )
+    second = manager.exec_validation_command(
+        "docker-gso-validation-test", "echo second"
+    )
+    manager.close_validation_container("docker-gso-validation-test")
+
+    create_commands = [
+        command for command in commands if command[:2] == ["docker", "create"]
+    ]
+    exec_commands = [
+        command for command in commands if command[:2] == ["docker", "exec"]
+    ]
+    assert len(create_commands) == 1
+    assert create_commands[0][-1].endswith("sleep 3600; done")
+    assert "echo first" in exec_commands[0][-1]
+    assert "echo second" in exec_commands[1][-1]
+    assert first.returncode == second.returncode == 0
+    assert commands[-1][:3] == ["docker", "rm", "--force"]
+
+
+def test_kept_validation_container_is_stopped_not_left_running(
+    tmp_path, monkeypatch
+):
+    manager = DockerManager(
+        image="gso-prepared:latest",
+        artifact_dir=tmp_path,
+        keep_containers=True,
+    )
+    commands = []
+    monkeypatch.setattr(
+        manager,
+        "_run",
+        lambda command, **kwargs: (
+            commands.append(command)
+            or SimpleNamespace(returncode=0, stdout="", stderr="")
+        ),
+    )
+
+    manager.close_validation_container("docker-gso-kept")
+
+    assert commands == [["docker", "stop", "--time", "5", "docker-gso-kept"]]
+
+
 def test_prepare_commit_image_installs_parent_once_without_xdg_cache(
     tmp_path, monkeypatch
 ):

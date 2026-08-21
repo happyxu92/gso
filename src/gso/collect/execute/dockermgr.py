@@ -581,6 +581,117 @@ fi
             )
         self._run(["docker", "rm", "--force", cluster], capture_output=True)
 
+    def start_validation_container(self, cluster: str) -> None:
+        """Start a long-lived container used for serial generation validation."""
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]+", cluster):
+            raise ValueError(f"Invalid Docker container name: {cluster!r}")
+
+        self._remove_stale_container(cluster)
+        command = [
+            "docker",
+            "create",
+            "--name",
+            cluster,
+            "--init",
+            "--label",
+            "gso.managed=true",
+            "--label",
+            f"gso.task={cluster}",
+            "--workdir",
+            "/workspace",
+            *self._platform_args(),
+        ]
+        command.extend(self._cache_mount_args())
+        if self.cpus is not None:
+            command.extend(["--cpus", str(self.cpus)])
+        if self.memory:
+            command.extend(["--memory", self.memory])
+        for env_name in ("HF_TOKEN", "DEBUG_GSO"):
+            if os.getenv(env_name):
+                command.extend(["--env", env_name])
+        command.extend(
+            [
+                self.image,
+                "/bin/bash",
+                "-lc",
+                "trap 'exit 0' TERM INT; while true; do sleep 3600; done",
+            ]
+        )
+        self._run(command, capture_output=True)
+        try:
+            self._run(["docker", "start", cluster], capture_output=True)
+        except Exception:
+            self._run(
+                ["docker", "rm", "--force", cluster],
+                check=False,
+                capture_output=True,
+            )
+            raise
+        with self._lock:
+            self._containers.add(cluster)
+
+    def validation_container_running(self, cluster: str) -> bool:
+        """Return whether a managed validation container is still running."""
+        result = self._run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                cluster,
+            ],
+            check=False,
+            capture_output=True,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def copy_validation_workspace(
+        self, cluster: str, workspace: Path, destination: str
+    ) -> None:
+        """Copy one isolated test workspace into a validation container."""
+        mkdir = self._run(
+            ["docker", "exec", cluster, "mkdir", "-p", destination],
+            check=False,
+            capture_output=True,
+        )
+        if mkdir.returncode != 0:
+            raise RuntimeError(
+                f"Failed to create validation workspace {destination}: "
+                f"{(mkdir.stderr or mkdir.stdout).strip()}"
+            )
+        self._run(
+            [
+                "docker",
+                "cp",
+                f"{Path(workspace).resolve()}/.",
+                f"{cluster}:{destination}/",
+            ],
+            capture_output=True,
+        )
+
+    def exec_validation_command(
+        self, cluster: str, command: str
+    ) -> subprocess.CompletedProcess:
+        """Execute one validation command with the prepared environment loaded."""
+        shell_command = f"{self._cache_shell_setup()}\n{command}"
+        return self._run(
+            ["docker", "exec", cluster, "/bin/bash", "-lc", shell_command],
+            check=False,
+            capture_output=True,
+        )
+
+    def close_validation_container(self, cluster: str) -> None:
+        """Stop a persistent validation container and remove it unless retained."""
+        if self.keep_containers:
+            self._run(
+                ["docker", "stop", "--time", "5", cluster],
+                check=False,
+                capture_output=True,
+            )
+            logger.info(f"Stopped and kept Docker validation container: {cluster}")
+            return
+        self.cleanup_cluster(cluster)
+
     def launch_task(
         self,
         task_yaml: str,

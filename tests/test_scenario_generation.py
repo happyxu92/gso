@@ -1,5 +1,4 @@
 import json
-import re
 from types import SimpleNamespace
 
 import pytest
@@ -12,10 +11,7 @@ from gso.collect.generate.generate import (
     API_PREFLIGHT_RESULT_PREFIX,
     CommitGenerationResult,
     CommitGenerationTask,
-    GENERATION_EVENT_PREFIX,
-    GENERATION_PROGRESS_PREFIX,
     PerfExpGenerator,
-    SEMANTIC_RETRY_COUNT,
     build_api_preflight_test,
     create_generation_problem,
     generate_commit_tests,
@@ -34,6 +30,7 @@ from gso.collect.generate.context import prepare_mp_helper
 from gso.collect.generate.helpers import (
     GeneratedScenarioError,
     get_generated_scenario_and_test,
+    parse_generated_test_batch,
 )
 from gso.data import PerformanceCommit, Problem, Repo, Tests as CommitTests
 from gso.utils import llm as llm_utils
@@ -79,6 +76,14 @@ def run_test(eqcheck=False, reference=False, prefix=''):
 
 def combined_output(scenario=SCENARIO_TEMPLATE, test=VALID_TEST):
     return f"```json\n{json.dumps(scenario)}\n```\n\n```python\n{test}\n```"
+
+
+def batch_output(*items):
+    return json.dumps({"tests": list(items)})
+
+
+def batch_item(slot, scenario, code=VALID_TEST):
+    return {"slot": slot, "scenario": scenario, "code": code}
 
 
 def test_generation_defaults_to_four_commit_workers_and_five_tests():
@@ -842,7 +847,23 @@ def test_single_completion_disables_payload_level_parallelism(monkeypatch):
     }
 
 
-def test_commit_worker_generates_scenario_and_test_together(monkeypatch):
+def test_batched_response_parser_preserves_valid_slots_and_reports_missing():
+    parsed = parse_generated_test_batch(
+        batch_output(batch_item(1, "first")),
+        expected_slots={1, 2},
+    )
+
+    assert parsed.items[1].scenario == "first"
+    assert 2 in parsed.errors
+
+    with pytest.raises(GeneratedScenarioError, match="unrequested slot"):
+        parse_generated_test_batch(
+            batch_output(batch_item(3, "unexpected")),
+            expected_slots={1, 2},
+        )
+
+
+def test_commit_worker_generates_all_slots_in_one_llm_request(monkeypatch):
     repo = Repo(
         repo_url="https://github.com/example/repo",
         repo_owner="example",
@@ -857,260 +878,129 @@ def test_commit_worker_generates_scenario_and_test_together(monkeypatch):
     )
     problem = Problem(pid="repo.target", repo=repo, api="target", commits=[commit])
     args = PerfExpGenArgs(
-        yaml_path="unused.yaml",
-        model_name="custom-model",
-        n=2,
-        multiprocess=30,
-        use_cache=False,
+        yaml_path="unused.yaml", model_name="custom-model", n=2, use_cache=False
     )
 
     def fake_prepare(task_args):
-        _, _, prepared_commit, _ = task_args
+        prepared_commit = task_args[2]
         commit_tests = CommitTests.from_commit(prepared_commit)
-        commit_tests.init_chat(
-            "test system",
-            "commit context",
-            "write test\n\nRepo-specific Instructions:\nUse repository fixtures.",
+        commit_tests.init_chat("test system", "commit context", "write test")
+        return commit_tests
+
+    calls = []
+
+    def fake_completion(request_args, payload, *, stream):
+        calls.append((request_args, payload, stream))
+        return batch_output(
+            batch_item(1, "first scenario"),
+            batch_item(2, "second scenario", VALID_TEST + "\n# slot 2"),
         )
+
+    monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
+    monkeypatch.setattr(
+        "gso.collect.generate.generate.get_llm_completion", fake_completion
+    )
+
+    result = generate_commit_tests(
+        CommitGenerationTask(
+            problem_index=0,
+            commit_index=0,
+            repo=repo,
+            problem=problem,
+            commit=commit,
+            args=args,
+        )
+    )
+
+    assert result.error is None
+    assert result.commit_tests.num_samples() == 2
+    assert len(calls) == 1
+    prompt = calls[0][1][-1]["content"]
+    assert "Create exactly 2" in prompt
+    assert "slot` values must be exactly [1, 2]" in prompt
+    assert prompt.count("Use repository fixtures.") == 1
+    assert result.scenarios == ["first scenario", "second scenario"]
+    assert result.commit_tests.samples[0].startswith(
+        "# GSO generated scenario: first scenario"
+    )
+
+
+def test_commit_worker_repairs_only_failed_slots_in_same_session(monkeypatch):
+    repo = Repo(
+        repo_url="https://github.com/example/repo",
+        repo_owner="example",
+        repo_name="repo",
+    )
+    commit = PerformanceCommit(
+        commit_hash="abcdef1234567890",
+        subject="Optimize target API",
+        message="Optimize target API",
+        date="2024-01-01T00:00:00",
+    )
+    problem = Problem(pid="repo.target", repo=repo, api="target", commits=[commit])
+    args = PerfExpGenArgs(
+        yaml_path="unused.yaml", model_name="custom-model", n=2, use_cache=True
+    )
+
+    def fake_prepare(task_args):
+        commit_tests = CommitTests.from_commit(task_args[2])
+        commit_tests.init_chat("test system", "commit context", "write test")
         return commit_tests
 
     responses = iter(
         [
-            combined_output({**SCENARIO_TEMPLATE, "title": "first"}),
-            combined_output({**SCENARIO_TEMPLATE, "title": "second"}),
+            batch_output(
+                batch_item(1, "successful scenario"),
+                batch_item(2, "failing scenario", VALID_TEST + "\n# failing"),
+            ),
+            batch_output(
+                batch_item(2, "repaired scenario", VALID_TEST + "\n# repaired")
+            ),
         ]
     )
-    payloads = []
-
-    def fake_completion(request_args, payload, *, stream):
-        assert stream is False
-        payloads.append(payload)
-        return next(responses)
-
-    monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
-    monkeypatch.setattr(
-        "gso.collect.generate.generate.get_llm_completion",
-        fake_completion,
-    )
-
-    result = generate_commit_tests(
-        CommitGenerationTask(
-            problem_index=0,
-            commit_index=0,
-            repo=repo,
-            problem=problem,
-            commit=commit,
-            args=args,
-        )
-    )
-
-    assert result.error is None
-    assert result.commit_tests is not None
-    assert result.commit_tests.num_samples() == 2
-    assert len(payloads) == 2
-    assert payloads[0][0]["content"] == "test system"
-    assert [message["role"] for message in payloads[0]] == ["system", "user"]
-    assert payloads[0][1]["content"].startswith(
-        "commit context\n\nCreate one benchmark"
-    )
-    assert "write test" not in payloads[0][1]["content"]
-    assert payloads[0][1]["content"].count("Use repository fixtures.") == 1
-    assert "Return exactly two fenced blocks" in payloads[0][1]["content"]
-    assert "use only APIs and behavior available before the optimization" in (
-        payloads[0][1]["content"]
-    )
-    assert [message["role"] for message in payloads[1]] == ["system", "user"]
-    assert '"title":"first"' in payloads[1][1]["content"].replace(" ", "")
-    # Duplicate test code is intentionally accepted; no deduplication is performed.
-    assert len(result.test_outputs) == 2
-    assert result.commit_tests.samples[0].startswith("# GSO generated scenario:")
-    assert "# title: first" in result.commit_tests.samples[0]
-    assert "# title: second" in result.commit_tests.samples[1]
-
-
-def test_commit_worker_retries_invalid_scenario_without_cache(monkeypatch):
-    repo = Repo(
-        repo_url="https://github.com/example/repo",
-        repo_owner="example",
-        repo_name="repo",
-    )
-    commit = PerformanceCommit(
-        commit_hash="abcdef1234567890",
-        subject="Optimize target API",
-        message="Optimize target API",
-        date="2024-01-01T00:00:00",
-    )
-    problem = Problem(pid="repo.target", repo=repo, api="target", commits=[commit])
-    args = PerfExpGenArgs(
-        yaml_path="unused.yaml",
-        model_name="custom-model",
-        n=1,
-        use_cache=True,
-    )
-
-    def fake_prepare(task_args):
-        _, _, prepared_commit, _ = task_args
-        commit_tests = CommitTests.from_commit(prepared_commit)
-        commit_tests.init_chat("test system", "commit context", "write test")
-        return commit_tests
-
-    invalid_scenario = (
-        '```json\n{"title": "broken", "workload": unquoted}\n```\n'
-        f"```python\n{VALID_TEST}\n```"
-    )
-    responses = iter([invalid_scenario, combined_output()])
-    calls = []
-
-    def fake_completion(request_args, payload, *, stream):
-        assert stream is False
-        calls.append((request_args, payload))
-        return next(responses)
-
-    monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
-    monkeypatch.setattr(
-        "gso.collect.generate.generate.get_llm_completion",
-        fake_completion,
-    )
-
-    result = generate_commit_tests(
-        CommitGenerationTask(
-            problem_index=0,
-            commit_index=0,
-            repo=repo,
-            problem=problem,
-            commit=commit,
-            args=args,
-        )
-    )
-
-    assert result.error is None
-    assert result.commit_tests is not None
-    assert result.commit_tests.num_samples() == 1
-    assert len(calls) == 2
-    assert calls[0][0].use_cache is True
-    assert calls[1][0].use_cache is False
-    assert [message["role"] for message in calls[1][1]] == ["system", "user"]
-    retry_instruction = calls[1][1][-1]["content"]
-    assert "semantic retry 1 of 3" in retry_instruction
-    assert "invalid JSON" in retry_instruction
-
-
-def test_commit_worker_retries_invalid_test_without_cache(monkeypatch):
-    repo = Repo(
-        repo_url="https://github.com/example/repo",
-        repo_owner="example",
-        repo_name="repo",
-    )
-    commit = PerformanceCommit(
-        commit_hash="abcdef1234567890",
-        subject="Optimize target API",
-        message="Optimize target API",
-        date="2024-01-01T00:00:00",
-    )
-    problem = Problem(pid="repo.target", repo=repo, api="target", commits=[commit])
-    args = PerfExpGenArgs(
-        yaml_path="unused.yaml",
-        model_name="custom-model",
-        n=1,
-        use_cache=True,
-    )
-
-    def fake_prepare(task_args):
-        _, _, prepared_commit, _ = task_args
-        commit_tests = CommitTests.from_commit(prepared_commit)
-        commit_tests.init_chat("test system", "commit context", "write test")
-        return commit_tests
-
-    invalid_test = "```python\nimport timeit\n```"
-    invalid_output = f"```json\n{json.dumps(SCENARIO_TEMPLATE)}\n```\n{invalid_test}"
-    responses = iter([invalid_output, combined_output()])
-    calls = []
-
-    def fake_completion(request_args, payload, *, stream):
-        assert stream is False
-        calls.append((request_args, payload))
-        return next(responses)
-
-    monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
-    monkeypatch.setattr(
-        "gso.collect.generate.generate.get_llm_completion",
-        fake_completion,
-    )
-
-    result = generate_commit_tests(
-        CommitGenerationTask(
-            problem_index=0,
-            commit_index=0,
-            repo=repo,
-            problem=problem,
-            commit=commit,
-            args=args,
-        )
-    )
-
-    assert result.error is None
-    assert result.commit_tests is not None
-    assert result.commit_tests.num_samples() == 1
-    assert result.test_outputs == [invalid_output, combined_output()]
-    assert calls[0][0].use_cache is True
-    assert calls[1][0].use_cache is False
-    retry_instruction = calls[1][1][-1]["content"]
-    assert "semantic retry 1 of 3" in retry_instruction
-    assert "missing required function" in retry_instruction
-
-
-def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch, capsys):
-    repo = Repo(
-        repo_url="https://github.com/example/repo",
-        repo_owner="example",
-        repo_name="repo",
-    )
-    commit = PerformanceCommit(
-        commit_hash="abcdef1234567890",
-        subject="Optimize target API",
-        message="Optimize target API",
-        date="2024-01-01T00:00:00",
-    )
-    problem = Problem(pid="repo.target", repo=repo, api="target", commits=[commit])
-    args = PerfExpGenArgs(
-        yaml_path="unused.yaml",
-        model_name="custom-model",
-        n=1,
-        use_cache=True,
-    )
-
-    def fake_prepare(task_args):
-        _, _, prepared_commit, _ = task_args
-        commit_tests = CommitTests.from_commit(prepared_commit)
-        commit_tests.init_chat("test system", "commit context", "write test")
-        return commit_tests
-
-    responses = iter([combined_output(), combined_output()])
     completion_calls = []
-    execution_calls = []
 
     def fake_completion(request_args, payload, *, stream):
-        assert stream is False
         completion_calls.append((request_args, payload))
         return next(responses)
 
-    def fake_evaluate(problem_arg, commit_arg, test_arg, config_arg):
-        execution_calls.append(test_arg)
-        if len(execution_calls) == 1:
-            return GeneratedTestExecutionResult(
-                passed=False,
-                error="AssertionError: candidate output differs from reference",
-                log_path="/tmp/test-execution.log",
-            )
-        return GeneratedTestExecutionResult(passed=True)
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+            self.entered = 0
+            self.exited = 0
+
+        def __enter__(self):
+            self.entered += 1
+            return self
+
+        def __exit__(self, *args):
+            self.exited += 1
+
+        def validate(self, test, *, slot, attempt):
+            self.calls.append((slot, attempt, test))
+            if slot == 2 and attempt == 1:
+                return GeneratedTestExecutionResult(
+                    passed=False,
+                    error="NameError: missing parent API",
+                    log_path="/tmp/slot-2-attempt-1.log",
+                )
+            return GeneratedTestExecutionResult(passed=True)
+
+    session = FakeSession()
+    open_calls = []
+
+    def fake_open(*args):
+        open_calls.append(args)
+        return session
 
     monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
     monkeypatch.setattr(
-        "gso.collect.generate.generate.get_llm_completion",
-        fake_completion,
+        "gso.collect.generate.generate.get_llm_completion", fake_completion
     )
     monkeypatch.setattr(
-        "gso.collect.generate.generate.evaluate_generated_test", fake_evaluate
+        "gso.collect.generate.generate.open_generated_test_validation_session",
+        fake_open,
     )
 
     result = generate_commit_tests(
@@ -1126,147 +1016,39 @@ def test_commit_worker_retries_failed_execution_and_records_reason(monkeypatch, 
     )
 
     assert result.error is None
-    assert len(execution_calls) == 2
-    assert result.test_attempts[0]["error"].endswith(
-        "AssertionError: candidate output differs from reference"
-    )
-    assert result.test_attempts[0]["execution_log"] == "/tmp/test-execution.log"
-    assert result.test_attempts[1]["error"] is None
-    retry_instruction = completion_calls[1][1][-1]["content"]
-    assert "semantic retry 1 of 3" in retry_instruction
-    assert "candidate output differs from reference" in retry_instruction
-    output_lines = [
-        re.sub(r"(?<==)\d+\.\d+s", "<seconds>", line)
-        for line in capsys.readouterr().out.splitlines()
+    assert result.commit_tests.num_samples() == 2
+    assert len(open_calls) == 1
+    assert session.entered == session.exited == 1
+    assert [(slot, attempt) for slot, attempt, _ in session.calls] == [
+        (1, 1),
+        (2, 1),
+        (2, 2),
     ]
-    assert output_lines == [
-        (
-            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
-            "test 1/1 | requesting test"
-        ),
-        (
-            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
-            "test 1/1 | starting test (attempt 1/4)"
-        ),
-        (
-            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
-            "test 1/1 | test failed (log: /tmp/test-execution.log)"
-        ),
-        (
-            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
-            "test 1/1 | re-requesting test (semantic retry 1/3)"
-        ),
-        (
-            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
-            "test 1/1 | starting test (attempt 2/4)"
-        ),
-        (
-            f"{GENERATION_EVENT_PREFIX} target 1/1 | repo.target/abcdef1 | "
-            "test 1/1 | test passed"
-        ),
-        (
-            f"{GENERATION_PROGRESS_PREFIX} target 1/1 | repo.target/abcdef1 | "
-            "test 1/1 accepted | accepted=1 | skipped=0 | "
-            "semantic_retries=1 | elapsed=<seconds> | llm=<seconds> | "
-            "validation=<seconds> | slots complete"
-        ),
-    ]
+    assert len(completion_calls) == 2
+    assert completion_calls[0][0].use_cache is True
+    assert completion_calls[1][0].use_cache is False
+    repair_prompt = completion_calls[1][1][-1]["content"]
+    assert '"successful_tests"' in repair_prompt
+    assert '"scenario": "successful scenario"' in repair_prompt
+    assert '"failed_tests"' in repair_prompt
+    assert '"scenario": "failing scenario"' in repair_prompt
+    assert "NameError: missing parent API" in repair_prompt
+    assert "Return exactly failed slots [2]" in repair_prompt
+    assert result.scenarios == ["successful scenario", "repaired scenario"]
 
 
-def test_commit_worker_skips_failed_test_slot_and_continues(monkeypatch, capsys):
-    repo = Repo(
-        repo_url="https://github.com/example/repo",
-        repo_owner="example",
-        repo_name="repo",
+def test_repair_response_cannot_overwrite_a_successful_slot(monkeypatch):
+    parsed_initial = parse_generated_test_batch(
+        batch_output(batch_item(1, "accepted"), batch_item(2, "failed")),
+        expected_slots={1, 2},
     )
-    commit = PerformanceCommit(
-        commit_hash="abcdef1234567890",
-        subject="Optimize target API",
-        message="Optimize target API",
-        date="2024-01-01T00:00:00",
-    )
-    problem = Problem(pid="repo.target", repo=repo, api="target", commits=[commit])
-    args = PerfExpGenArgs(yaml_path="unused.yaml", model_name="custom-model", n=2)
+    assert set(parsed_initial.items) == {1, 2}
 
-    def fake_prepare(task_args):
-        _, _, prepared_commit, _ = task_args
-        commit_tests = CommitTests.from_commit(prepared_commit)
-        commit_tests.init_chat("test system", "commit context", "write test")
-        return commit_tests
-
-    responses = iter(
-        [
-            *([combined_output()] * (SEMANTIC_RETRY_COUNT + 1)),
-            combined_output({**SCENARIO_TEMPLATE, "title": "second"}),
-        ]
-    )
-    execution_count = 0
-
-    def fake_evaluate(*args):
-        nonlocal execution_count
-        execution_count += 1
-        if execution_count <= SEMANTIC_RETRY_COUNT + 1:
-            return GeneratedTestExecutionResult(passed=False, error="always fails")
-        return GeneratedTestExecutionResult(passed=True)
-
-    monkeypatch.setattr("gso.collect.generate.generate.prepare_mp_helper", fake_prepare)
-    monkeypatch.setattr(
-        "gso.collect.generate.generate.get_llm_completion",
-        lambda request_args, payload, *, stream: next(responses),
-    )
-    monkeypatch.setattr(
-        "gso.collect.generate.generate.evaluate_generated_test", fake_evaluate
-    )
-
-    result = generate_commit_tests(
-        CommitGenerationTask(
-            problem_index=0,
-            commit_index=0,
-            repo=repo,
-            problem=problem,
-            commit=commit,
-            args=args,
-            execution_config=GeneratedTestExecutionConfig(exp_id="repo"),
+    with pytest.raises(GeneratedScenarioError, match="unrequested slot"):
+        parse_generated_test_batch(
+            batch_output(batch_item(1, "overwrite"), batch_item(2, "repair")),
+            expected_slots={2},
         )
-    )
-
-    assert result.error is None
-    assert result.commit_tests is not None
-    assert result.commit_tests.num_samples() == 1
-    assert execution_count == SEMANTIC_RETRY_COUNT + 2
-    assert len(result.test_attempts) == SEMANTIC_RETRY_COUNT + 2
-    assert result.failed_test_slots == [
-        {
-            "scenario_index": 1,
-            "error": (
-                "repo.target/abcdef1 scenario/test 1: automated execution failed:\n"
-                "always fails"
-            ),
-            "execution_log": None,
-        }
-    ]
-    assert result.test_attempts[-1]["scenario_index"] == 2
-    assert result.test_attempts[-1]["error"] is None
-    assert "# title: second" in result.commit_tests.samples[0]
-    output_lines = [
-        re.sub(r"(?<==)\d+\.\d+s", "<seconds>", line)
-        for line in capsys.readouterr().out.splitlines()
-    ]
-    assert [
-        line for line in output_lines if line.startswith(GENERATION_PROGRESS_PREFIX)
-    ] == [
-        (
-            f"{GENERATION_PROGRESS_PREFIX} target 1/1 | repo.target/abcdef1 | "
-            "test 1/2 skipped | accepted=0 | skipped=1 | semantic_retries=3 | "
-            "elapsed=<seconds> | llm=<seconds> | validation=<seconds>"
-        ),
-        (
-            f"{GENERATION_PROGRESS_PREFIX} target 1/1 | repo.target/abcdef1 | "
-            "test 2/2 accepted | accepted=1 | skipped=1 | "
-            "semantic_retries=3 | elapsed=<seconds> | llm=<seconds> | "
-            "validation=<seconds> | slots complete"
-        ),
-    ]
 
 
 def test_generator_skips_failed_commit_and_saves_successful_commit(
