@@ -1,0 +1,17 @@
+repository,url,stars,formulacode_official_evaluation
+Textualize/rich,https://github.com/Textualize/rich,55903,true
+tqdm/tqdm,https://github.com/tqdm/tqdm,31064,true
+networkx/networkx,https://github.com/networkx/networkx,16764,true
+optuna/optuna,https://github.com/optuna/optuna,13778,true
+kedro-org/kedro,https://github.com/kedro-org/kedro,10801,true
+modin-project/modin,https://github.com/modin-project/modin,10365,true
+pymc-devs/pymc,https://github.com/pymc-devs/pymc,9551,true
+HIPS/autograd,https://github.com/HIPS/autograd,7469,true
+Qiskit/qiskit,https://github.com/Qiskit/qiskit,7181,true
+scikit-image/scikit-image,https://github.com/scikit-image/scikit-image,6487,true
+geopandas/geopandas,https://github.com/geopandas/geopandas,5078,true
+quantumlib/Cirq,https://github.com/quantumlib/Cirq,4903,true
+dedupeio/dedupe,https://github.com/dedupeio/dedupe,4449,true
+shapely/shapely,https://github.com/shapely/shapely,4408,true
+pydata/xarray,https://github.com/pydata/xarray,4121,true
+deepchecks/deepchecks,https://github.com/deepchecks/deepchecks,3999,true
