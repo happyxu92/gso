@@ -128,16 +128,56 @@ def request_install_commands_from_codex(
         )
         return None
 
-    prompt = f"""Inspect the repository in your current working directory and determine
-the shell commands needed to install it for GSO performance-test generation.
+    prompt = f"""Inspect the repository and determine the shell commands needed to
+ install it for GSO performance-test generation.
 
-Constraints:
-- The environment is Ubuntu and commands run from the repository root.
+Execution environment:
+- Ubuntu 22.04, running as root from the repository root.
+- sudo is not installed. Never use sudo; use apt-get directly for system packages.
 - Python {py_version} is requested.
-- Use uv for virtual-environment creation and Python package installation when practical.
-- Include creation and activation of .venv when needed.
-- Install the repository itself plus runtime/test dependencies needed to import and exercise it.
-- Include the requests package, which the GSO harness requires.
+- Commands run non-interactively and with network access.
+
+Before deciding:
+- Inspect pyproject.toml, setup.py, setup.cfg, requirements files, lockfiles, current
+  CI workflows, Dockerfiles, and installation documentation that actually exist.
+- Prefer commands demonstrated by the current CI configuration, adapted to uv and this
+  container environment.
+- Verify that every referenced file exists.
+- Before using an extra such as .[test], .[dev], or .[testing], verify its exact name in
+  pyproject.toml, setup.py, or setup.cfg. Do not infer extra names from convention.
+- Before using --group, verify that the dependency group exists in pyproject.toml. Do
+  not infer group names from convention. Prefer a suitable declared project extra over
+  a uv dependency group when both are available.
+
+Installation requirements:
+- Create .venv with uv using Python {py_version}.
+- Pass --python .venv/bin/python explicitly to every uv pip command; do not rely on
+  virtual-environment activation persisting between commands.
+- Install requests, which the GSO harness requires.
+- Install the repository itself and only the minimum runtime or test dependencies needed
+  to import and exercise its Python APIs.
+- Install full test/development dependency sets and heavyweight optional dependencies
+  only when the current HEAD requires them for those operations.
+- Prefer uv for Python package installation when practical.
+- Do not use --locked or --frozen; lockfiles may be absent or stale. Resolve dependencies
+  from the checked-out HEAD instead.
+- Never use --ignore-requires-python. Respect the repository's Requires-Python metadata
+  rather than forcing installation on an unsupported interpreter.
+- For legacy setuptools-based projects, install setuptools and wheel explicitly before
+  the repository when needed. If the build imports pkg_resources, choose a setuptools
+  version that still provides it based on the HEAD build metadata.
+- Use --no-build-isolation only when the repository's current build setup justifies it.
+- Install system build tools and libraries only when required by the current HEAD. When
+  apt packages are needed, combine update and installation in one non-interactive command:
+  DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ...
+- Do not build documentation, frontend assets, examples, benchmarks, or unrelated
+  language components.
+- Do not run a full native project build when a normal editable or wheel installation of
+  the Python package is sufficient.
+- Do not suppress failures with || true, ignored exit codes, or unconditional fallbacks.
+  Every command must fail normally when installation is unsuccessful.
+
+Output requirements:
 - Do not run installation commands and do not modify any files.
 - Return only the structured install_commands result required by the response schema.
 - Each array item must be one executable shell command, in execution order.
