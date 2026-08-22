@@ -35,6 +35,7 @@ Common options::
     --max-year 2022           commit year cutoff (analysis + generation)
     -n 5                      target tests per commit
     --test-timeout 300        seconds allowed for each execute test invocation
+    --min-speedup-factor 1.1  minimum speedup for dataset selection
     --api pkg.api             restrict generate/execute/evaluate to one API
     --api-key-envs KEY_1,KEY_2
                               rotate API key environment names across YAMLs
@@ -76,6 +77,7 @@ DEFAULT_MAX_COMMITS = 300
 DEFAULT_TESTS_PER_COMMIT = 5
 DEFAULT_EXEC_MACHINES = 1
 DEFAULT_TEST_TIMEOUT = 300
+DEFAULT_MIN_SPEEDUP_FACTOR = 1.1
 DEFAULT_CONCURRENCY = 3
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
@@ -114,6 +116,13 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
     return parsed
 
 
@@ -270,6 +279,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         help=(
             "timeout in seconds for each test invocation during execute "
             f"(default: {DEFAULT_TEST_TIMEOUT})"
+        ),
+    )
+    p.add_argument(
+        "--min-speedup-factor",
+        type=_positive_float,
+        default=DEFAULT_MIN_SPEEDUP_FACTOR,
+        help=(
+            "minimum speedup factor for evaluation dataset selection "
+            f"(default: {DEFAULT_MIN_SPEEDUP_FACTOR})"
         ),
     )
     p.add_argument(
@@ -647,6 +665,8 @@ def build_stages(
         "--output-dir",
         str(plots_dir),
         "--build-dataset",
+        "--min-speedup-factor",
+        str(args.min_speedup_factor),
     ]
     if args.api:
         cmd += ["--api", args.api]

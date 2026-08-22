@@ -99,7 +99,10 @@ def build_dataset(
     debug=False,
     test_problems=None,
     long_running_problems=None,
+    min_speedup_factor=MIN_PROB_SPEEDUP,
 ):
+    if min_speedup_factor <= 0:
+        raise ValueError("min_speedup_factor must be positive")
     print(f"Loaded problems: {len(problems)}")
     test_problems = test_problems or DEFAULT_TEST_PROBLEMS
     long_running_problems = (
@@ -138,7 +141,7 @@ def build_dataset(
 
     # Filter by minimum speedup and take top K tests per prob
     opt_problems_df = (
-        analysis_df[analysis_df["speedup_factor"] >= MIN_PROB_SPEEDUP]
+        analysis_df[analysis_df["speedup_factor"] >= min_speedup_factor]
         .sort_values(["pid", "commit", "speedup_factor"], ascending=[True, True, False])
         .groupby(["pid", "commit"])
         .head(MAX_TEST_COUNT)
@@ -152,7 +155,7 @@ def build_dataset(
                     (analysis_df["pid"] == pid)
                     & (analysis_df["commit"] == commit)
                     & (analysis_df["speedup_factor"] > LOW_TEST_FALLBACK_SPEEDUP)
-                    & (analysis_df["speedup_factor"] < MIN_PROB_SPEEDUP)
+                    & (analysis_df["speedup_factor"] < min_speedup_factor)
                     & (~analysis_df["test_id"].isin(group["test_id"]))
                 ]
                 .sort_values("speedup_factor", ascending=False)
@@ -253,6 +256,7 @@ def main(
     backend="sky",
     results_file=None,
     pids_file=None,
+    min_speedup_factor=MIN_PROB_SPEEDUP,
 ):
     if backend not in {"sky", "docker"}:
         raise ValueError("backend must be 'sky' or 'docker'")
@@ -294,6 +298,7 @@ def main(
         debug=debug,
         test_problems=test_problems,
         long_running_problems=long_running_problems,
+        min_speedup_factor=min_speedup_factor,
     )
 
     # Save dataset to jsonl file
@@ -357,6 +362,12 @@ if __name__ == "__main__":
         "--pids-file",
         default=None,
         help="Custom Python file defining TEST_PROBLEMS and LONG_RUNNING_PROBLEMS",
+    )
+    parser.add_argument(
+        "--min-speedup-factor",
+        type=float,
+        default=MIN_PROB_SPEEDUP,
+        help=f"Minimum speedup factor for test selection (default: {MIN_PROB_SPEEDUP})",
     )
 
     args = parser.parse_args()

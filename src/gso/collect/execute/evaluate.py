@@ -12,11 +12,19 @@ import pandas as pd
 import seaborn as sns
 
 from gso.collect.execute.helpers import resolve_results_path
-from gso.constants import DATASET_DIR, EXPS_DIR, MIN_PROB_SPEEDUP
+from gso.constants import DATASET_DIR, EXPS_DIR
 from gso.utils.io import load_problems
 
 
+DEFAULT_MIN_SPEEDUP_FACTOR = 1.1
 _TIME_PATTERN = re.compile(r"Execution time:\s+([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)s")
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
 
 
 def has_non_python_changes(commit):
@@ -258,7 +266,7 @@ def create_performance_summary(df: pd.DataFrame) -> dict:
 
 def select_pid_commits(
     dataframe: pd.DataFrame,
-    min_speedup_factor: float = MIN_PROB_SPEEDUP,
+    min_speedup_factor: float = DEFAULT_MIN_SPEEDUP_FACTOR,
 ) -> list[tuple[str, str]]:
     """Select unique problem/commit pairs that can survive dataset filtering."""
     if min_speedup_factor <= 0:
@@ -333,6 +341,7 @@ def build_evaluated_dataset(
         backend=backend,
         results_file=results_file,
         pids_file=str(pids_path),
+        min_speedup_factor=min_speedup_factor,
     )
     dataset_path = DATASET_DIR / f"{effective_dataset_name}_dataset.jsonl"
     if not dataset_path.is_file():
@@ -357,7 +366,7 @@ def main(
     build_dataset: bool = False,
     pids_output: str | None = None,
     dataset_name: str | None = None,
-    min_speedup_factor: float = MIN_PROB_SPEEDUP,
+    min_speedup_factor: float = DEFAULT_MIN_SPEEDUP_FACTOR,
 ):
     """Analyze SkyPilot or local Docker collection results."""
     if backend not in {"sky", "docker"}:
@@ -585,9 +594,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--min-speedup-factor",
-        type=float,
-        default=MIN_PROB_SPEEDUP,
-        help=f"minimum speedup factor for PID selection (default: {MIN_PROB_SPEEDUP})",
+        type=_positive_float,
+        default=DEFAULT_MIN_SPEEDUP_FACTOR,
+        help=(
+            "minimum speedup factor for PID selection "
+            f"(default: {DEFAULT_MIN_SPEEDUP_FACTOR})"
+        ),
     )
     args = parser.parse_args()
 

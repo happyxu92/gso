@@ -35,6 +35,7 @@ def test_parse_args_uses_asset_template_and_300_commit_default():
     )
     assert args.max_commits == 300
     assert args.test_timeout == 300
+    assert args.min_speedup_factor == 1.1
 
 
 def test_pipeline_passes_test_timeout_to_execute_stage(tmp_path):
@@ -63,8 +64,13 @@ def test_pipeline_rejects_non_positive_test_timeout():
         parse_args(["repositories.csv", "--test-timeout", "0"])
 
 
+def test_pipeline_rejects_non_positive_min_speedup_factor():
+    with pytest.raises(SystemExit):
+        parse_args(["repositories.csv", "--min-speedup-factor", "0"])
+
+
 def test_pipeline_evaluate_stage_builds_dataset(tmp_path):
-    args = parse_args(["repositories.csv"])
+    args = parse_args(["repositories.csv", "--min-speedup-factor", "1.25"])
     paths = compute_paths(tmp_path / "buckets")
 
     stages = build_stages(
@@ -81,6 +87,8 @@ def test_pipeline_evaluate_stage_builds_dataset(tmp_path):
         command for name, command, _ in stages if name == "evaluate"
     )
     assert "--build-dataset" in evaluate_command
+    threshold_index = evaluate_command.index("--min-speedup-factor")
+    assert evaluate_command[threshold_index + 1] == "1.25"
 
 
 def test_pipeline_lowercases_only_the_docker_image_name(tmp_path):

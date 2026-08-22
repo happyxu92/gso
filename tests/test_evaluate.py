@@ -5,6 +5,17 @@ import pandas as pd
 from gso.collect.execute import evaluate
 
 
+def test_select_pid_commits_defaults_to_1_1_speedup():
+    dataframe = pd.DataFrame(
+        [
+            {"pid": "repo-pass", "commit": "aaaaaaa", "speedup_factor": 1.10},
+            {"pid": "repo-low", "commit": "bbbbbbb", "speedup_factor": 1.09},
+        ]
+    )
+
+    assert evaluate.select_pid_commits(dataframe) == [("repo-pass", "aaaaaaa")]
+
+
 def test_select_pid_commits_filters_deduplicates_and_sorts():
     dataframe = pd.DataFrame(
         [
@@ -84,5 +95,6 @@ def test_build_evaluated_dataset_exports_pids_and_invokes_builder(
             "backend": "docker",
             "results_file": None,
             "pids_file": str(pids_path),
+            "min_speedup_factor": 1.2,
         }
     ]
